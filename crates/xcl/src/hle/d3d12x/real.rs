@@ -38,6 +38,17 @@ use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, S_FALSE, S_OK};
 const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
 const MAX_SCAN: usize = 512;
+/// Words of the host's own table mirrored in front of an extended vtable. A C++ object's
+/// table pointer is also the way to the words in front of the table: type information and
+/// offset-to-top (Itanium ABI) or the RTTI locator (MSVC), and before those the virtual-base
+/// and virtual-call offsets of a class with virtual inheritance. A host that runs
+/// `dynamic_cast` on an object it is handed, or adjusts `this` through those offsets (Apple's
+/// D3DMetal does both), reads them through the object's table pointer.
+const PREFIX: usize = 16;
+/// Words in front of an extended vtable: the original table's address, then the mirror.
+const HDR: usize = PREFIX + 1;
+/// words of a native host's method table kept after the public methods (see `class_for`)
+const NATIVE_HOST_TAIL: usize = 512;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
@@ -535,6 +546,15 @@ pub fn init() -> Result<String, String> {
         super::device_x::probe_dynamic_depth_bias(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
+        // The inlined D3D12.X of a retail game tests a byte of the console's device at +0x18
+        // (11 places, e.g. exe+0x6ddf5): 0 – it writes a CBV's V# and descriptor copies into
+        // the heap's memory itself; else it calls #17 / #24. Here the byte is the host
+        // object's, so which way a run goes is the host's doing: said once, for the log.
+        if crate::gpu::shader::readable(raw as usize + 0x18, 1) {
+            let b = *(raw as *const u8).add(0x18);
+            let way = if b == 0 { "writes CBVs and descriptor copies itself (no #17 / #24 calls)" } else { "calls CreateConstantBufferView / CopyDescriptorsSimple" };
+            crate::xlog_info!("D3D12.X: device byte +0x18 = {b:#04x} – console code with inlined descriptor writes {way}");
+        }
         DEVICE.store(raw as usize, Ordering::Release);
         *ADAPTER.lock().unwrap() = name.clone();
         Ok(name)
@@ -616,7 +636,7 @@ unsafe fn vt(obj: *mut c_void) -> *const usize {
 /// Original function of `slot` for an adopted object.
 pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     let ext = vt(this);
-    let orig = *ext.sub(1) as *const usize;
+    let orig = *ext.sub(HDR) as *const usize;
     *orig.add(slot)
 }
 
@@ -694,7 +714,7 @@ pub(super) unsafe fn readopt(obj: *mut c_void, kind: Kind) {
     if obj.is_null() || !is_ext(vt(obj) as usize) {
         return adopt(obj, kind);
     }
-    let orig = *vt(obj).sub(1);
+    let orig = *vt(obj).sub(HDR);
     *(obj as *mut usize) = class_for(obj, orig, kind);
 }
 
@@ -744,8 +764,29 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         .max()
         .unwrap_or(0);
     let total = (scanned + EXTRA_SLOTS).max(max_console);
-    let mut v: Vec<usize> = Vec::with_capacity(total + 1);
+    // A host D3D12 whose code is in no PE module (Apple's D3DMetal under Wine): its memory is
+    // not known to VirtualQuery (`gpu::shader::readable` probes it), the scan above cannot tell
+    // where its table ends (it stops at the first word that is in a module), and the host calls
+    // virtual methods of its own well past the public ones. Every slot up to `total` is taken
+    // as the host's and gets the guard – the host's own calls reach the host's word, a title's
+    // XCL's stub or method – and the host's words after them follow XCL's slots, so a call of
+    // its own never runs off the end.
+    let native_host = m0 == 0;
+    if native_host {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            crate::gpu::shader::NATIVE_HOST_MEMORY.store(true, Ordering::Relaxed);
+            crate::xlog_warn!("D3D12.X: the host's D3D12 is not a PE module (a native host: D3DMetal) – its memory is probed by reading, its tables keep their prefix and tail");
+        }
+    }
+    let scanned = if native_host { total } else { scanned };
+    let mut v: Vec<usize> = Vec::with_capacity(total + HDR + if native_host { NATIVE_HOST_TAIL } else { 0 });
     v.push(orig);
+    // (a table at the very start of its mapping has no words in front of it)
+    let prefix = native_host || crate::gpu::shader::readable(orig - 8 * PREFIX, 8 * PREFIX);
+    for k in (1..=PREFIX).rev() {
+        v.push(if prefix { *ot.sub(k) } else { 0 });
+    }
     for i in 0..scanned {
         v.push(*ot.add(i));
     }
@@ -753,17 +794,22 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     for i in public..scanned {
         let info = stubs::new_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
-        v[1 + i] = super::guard::make_guard(v[1 + i], info);
+        v[HDR + i] = super::guard::make_guard(v[HDR + i], info);
     }
     for i in scanned..total {
         let (addr, info) = stubs::make_stub_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
         v.push(addr);
     }
+    if native_host {
+        for i in total..public + NATIVE_HOST_TAIL {
+            v.push(*ot.add(i));
+        }
+    }
     for (method, f) in overrides(kind) {
         if let Some(s) = layout::slot(iface, method) {
             if s < public {
-                v[1 + s] = f;
+                v[HDR + s] = f;
             }
         }
     }
@@ -771,23 +817,23 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     let pc = v.clone();
     for (x, p) in console_remap(kind) {
         if x < public {
-            v[1 + x] = super::guard::make_split(pc[1 + p], pc[1 + x]);
+            v[HDR + x] = super::guard::make_split(pc[HDR + p], pc[HDR + x]);
         } else if x < scanned {
-            v[1 + x] = super::guard::make_split(pc[1 + p], *ot.add(x));
+            v[HDR + x] = super::guard::make_split(pc[HDR + p], *ot.add(x));
         } else if x < total {
-            v[1 + x] = pc[1 + p];
+            v[HDR + x] = pc[HDR + p];
         }
     }
     // slots where the console's method differs from the PC one at the same index
     for (slot, f) in console_slots(kind) {
         if slot < public {
-            v[1 + slot] = super::guard::make_split(f, v[1 + slot]);
+            v[HDR + slot] = super::guard::make_split(f, v[HDR + slot]);
         } else if slot < scanned {
             // an internal method of the runtime there (e.g. queue #30 = PresentX): the title
             // gets the console method, the runtime keeps its own
-            v[1 + slot] = super::guard::make_split(f, *ot.add(slot));
+            v[HDR + slot] = super::guard::make_split(f, *ot.add(slot));
         } else if slot < total {
-            v[1 + slot] = f;
+            v[HDR + slot] = f;
         }
     }
     // the other console extensions (device, command list): a title call is logged and answered
@@ -796,7 +842,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         let own: HashSet<usize> = console_slots(kind).iter().map(|e| e.0).chain(console_remap(kind).iter().map(|e| e.0)).collect();
         for i in (first..public).filter(|i| !own.contains(i)) {
             let (stub, _) = stubs::make_stub_info(DLL, &format!("{}::#{i} (console extension)", iface.name), 0);
-            v[1 + i] = super::guard::make_split(stub, v[1 + i]);
+            v[HDR + i] = super::guard::make_split(stub, v[HDR + i]);
         }
     }
     // methods the newer console layout keeps at other slots: picked at each call
@@ -807,19 +853,27 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             if newer >= total {
                 continue;
             }
-            let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
-            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+            let pc = if newer < scanned { *ot.add(newer) } else { v[HDR + newer] };
+            v[HDR + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[HDR + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
         }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
     if std::env::var_os("XCL_D3D12_TRACE").is_some() {
         for i in 0..public {
             let name = format!("{}::{} (#{i})", iface.name, iface.methods.get(i).copied().unwrap_or("?"));
-            v[1 + i] = super::guard::make_tracer(v[1 + i], name);
+            v[HDR + i] = super::guard::make_tracer(v[HDR + i], name);
+        }
+        // `XCL_D3D12_TRACE=all`: the console-only slots after the public methods too (a title
+        // renders through them)
+        if std::env::var("XCL_D3D12_TRACE").is_ok_and(|t| t == "all") {
+            for i in public..total {
+                let name = format!("{}::#{i} (console slot)", iface.name);
+                v[HDR + i] = super::guard::make_tracer(v[HDR + i], name);
+            }
         }
     }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
-    let ext = leaked.as_ptr() as usize + 8;
+    let ext = leaked.as_ptr() as usize + 8 * HDR;
     EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
     crate::xlog_info!(
         "D3D12.X: {} – {public} PC methods, {} internal slots under the guard, +{EXTRA_SLOTS} stubs ({kind:?}, PC vtable {})",
@@ -3172,10 +3226,23 @@ fn compile(src: &str, target: &str) -> Vec<u8> {
 /// Stand-in shaders used when the PC driver rejects a console shader.
 fn dummy() -> &'static Dummy {
     static D: OnceLock<Dummy> = OnceLock::new();
-    D.get_or_init(|| Dummy {
-        vs: compile("float4 main(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }", "vs_5_0"),
-        ps: compile("float4 main() : SV_Target { return float4(1, 0, 1, 1); }", "ps_5_0"),
-        cs: compile("[numthreads(1, 1, 1)] void main() {}", "cs_5_0"),
+    D.get_or_init(|| {
+        // On a native host DXIL from DXC first: a host that turns DXIL into its own shaders
+        // (Apple's D3DMetal) has nothing for a DXBC stand-in; the old compiler is the fallback.
+        let native = crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed);
+        let both = |src: &str, new: &str, old: &str| match native.then(|| crate::gpu::recomp::dxc::compile(src, "main", new, &[])) {
+            Some(Ok(b)) if !b.is_empty() => b,
+            Some(r) => {
+                crate::xlog_warn!("D3D12.X: stand-in {new} shader not compiled by DXC ({:?}) – using {old}", r.err());
+                compile(src, old)
+            }
+            None => compile(src, old),
+        };
+        Dummy {
+            vs: both("float4 main(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }", "vs_6_0", "vs_5_0"),
+            ps: both("float4 main() : SV_Target { return float4(1, 0, 1, 1); }", "ps_6_0", "ps_5_0"),
+            cs: both("[numthreads(1, 1, 1)] void main() {}", "cs_6_0", "cs_5_0"),
+        }
     })
 }
 
@@ -5724,8 +5791,9 @@ mod queue_tests {
         let mut pc = [0usize; 32];
         pc[14] = signal as usize;
         pc[18] = get_desc as usize;
-        let ext = [pc.as_ptr() as usize, 0];
-        let vtbl = ext.as_ptr() as usize + 8;
+        let mut ext = [0usize; HDR + 1];
+        ext[0] = pc.as_ptr() as usize;
+        let vtbl = ext.as_ptr() as usize + 8 * HDR;
         let mut obj = [vtbl];
         let this = obj.as_mut_ptr() as *mut c_void;
         let fence = 0x5EED_0000usize;
