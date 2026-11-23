@@ -691,9 +691,16 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
     // the resource itself is typeless (the console reads its depth buffers through views of the
     // depth and of the stencil plane; D3DMetal makes those only of a typeless resource)
-    let pc = if matches!(format, 118..=120) { 44 } else { format };
+    let pc = if matches!(format, 118..=120) { if depth_only() { 39 } else { 44 } } else { format };
     d[0x20..0x24].copy_from_slice(&pc.to_le_bytes());
     d
+}
+
+/// Whether the console's depth + stencil family becomes a depth-only one (a native D3D12 host,
+/// i.e. D3DMetal under Wine).
+pub fn depth_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::gpu::shader::NATIVE_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed) && !std::env::var("XCL_DEPTH_STENCIL").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// A DXGI format of the console only as the PC's nearest: the 16-bit depth + 8-bit stencil
@@ -701,6 +708,17 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
 /// 24-bit one (45, 46, 47). The PC driver refuses them: GTA VI's depth buffer got no size
 /// (GetResourceAllocationInfo) and the title stopped on its assertion.
 pub fn pc_format(f: u32) -> u32 {
+    // D3DMetal: Metal makes no depth-only view of a depth + stencil texture (its assertion ends
+    // the process), and the console reads these buffers through such views. There the family is
+    // depth only – D32_FLOAT, read as R32_FLOAT – and the stencil plane is lost
+    // (`XCL_DEPTH_STENCIL=1`: the 24-bit family as on Windows).
+    if depth_only() {
+        return match f {
+            118 => 40,
+            119 | 120 => 41,
+            f => f,
+        };
+    }
     match f {
         118 => 45,
         119 => 46,
@@ -822,7 +840,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let mut clear_pc = [0u8; 20];
     let clear = if !clear.is_null() && crate::gpu::shader::readable(clear as usize, 20) && matches!(*(clear as *const u32), 118..=120) {
         clear_pc = (clear as *const [u8; 20]).read_unaligned();
-        clear_pc[..4].copy_from_slice(&45u32.to_le_bytes());
+        clear_pc[..4].copy_from_slice(&pc_format(118).to_le_bytes());
         clear_pc.as_ptr() as *const c_void
     } else {
         clear
