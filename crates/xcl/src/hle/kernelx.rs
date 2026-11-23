@@ -328,11 +328,14 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // (`d3d12x::title_textures`), which needs its CPU writes to be seen: it is write-watched
     // like a graphics reservation. Without that such a texture was uploaded once, empty, and
     // never again (the game's glyph atlas: its menus lost their x-height letters).
+    // Not write-watched on a Mac unless `XCL_WATCHED_FALLBACK=1` (`watched_fallback`): textures
+    // there are compared by content (`title_textures::poll_unwatched`).
     if gpu_visible_fallback(addr, t, p) {
-        let q = reserve_watched(size, t, p);
+        let watched = watched_fallback();
+        let q = if watched { reserve_watched(size, t, p) } else { mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t), sanitize_protect(p)) };
         if !q.is_null() {
             mirrors::reserved(q as usize, size, t, p);
-            trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
+            trace_mem(if watched { "VirtualAlloc (GPU-visible, write-watched)" } else { "VirtualAlloc (GPU-visible, plain)" }, addr as usize, size, t as u64, p, q as usize);
             return q;
         }
     }
@@ -358,6 +361,20 @@ unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
     }
     q
+}
+
+/// Whether GPU-visible title memory that reaches the plain-memory fallback is write-watched:
+/// `XCL_WATCHED_FALLBACK=1` / `0`, else everywhere but on a Mac (`util::mac_host`). The title's
+/// heaps and its 24 GB of 64 KiB pages are in that memory, written with AVX2 masked stores,
+/// and Wine keeps a write watch by protecting pages: Rosetta cannot resume such a store after
+/// its fault (as with `coherent_heaps`). Textures there are compared by content instead
+/// (`title_textures::poll_unwatched`); a GPU view is still paired with its CPU view (`mirrors`).
+fn watched_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("XCL_WATCHED_FALLBACK") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => !crate::util::mac_host(),
+    })
 }
 
 /// Whether the title's GPU heaps go to the coherent window: `XCL_COHERENT_HEAPS=1` / `0`, else
@@ -463,9 +480,12 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         return 1;
     }
     let ok = mem::VirtualFree(addr, size, t);
-    if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
-        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+    if ok != 0 && t & 0x8000 != 0 {
+        // (a GPU-visible reservation that is not write-watched is paired too, `watched_fallback`)
         mirrors::released(addr as usize);
+        if GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+        }
     }
     ok
 }
