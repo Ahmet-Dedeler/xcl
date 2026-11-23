@@ -16,6 +16,8 @@ use windows::core::{Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, CLSID_DxcCompiler, DXC_CP_UTF8};
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
+/// DxcCreateInstance2(IMalloc, clsid, iid, object)
+type CreateInstance2 = unsafe extern "system" fn(*mut c_void, *const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
 fn candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
@@ -37,14 +39,15 @@ fn candidates() -> Vec<PathBuf> {
     v
 }
 
-static LIB: OnceLock<Result<(PathBuf, usize), String>> = OnceLock::new();
+/// (folder, DxcCreateInstance, DxcCreateInstance2 or 0)
+static LIB: OnceLock<Result<(PathBuf, usize, usize), String>> = OnceLock::new();
 
 /// Folder with dxcompiler.dll (+ dxil.dll) that will be used.
 pub fn location() -> Result<&'static Path, String> {
-    load().map(|(p, _)| p.as_path())
+    load().map(|(p, ..)| p.as_path())
 }
 
-fn load() -> Result<&'static (PathBuf, usize), String> {
+fn load() -> Result<&'static (PathBuf, usize, usize), String> {
     LIB.get_or_init(|| {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         for dir in candidates() {
@@ -62,7 +65,8 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
                     continue;
                 }
                 if let Some(f) = GetProcAddress(h, b"DxcCreateInstance\0".as_ptr()) {
-                    return Ok((dir, f as usize));
+                    let f2 = GetProcAddress(h, b"DxcCreateInstance2\0".as_ptr()).map_or(0, |f| f as usize);
+                    return Ok((dir, f as usize, f2));
                 }
             }
         }
@@ -74,12 +78,125 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
 
 /// The PC compiler's DxcCreateInstance (for titles that use the console's `dxcompiler_xs.dll`).
 pub fn create_instance() -> Option<usize> {
-    load().ok().map(|&(_, f)| f)
+    load().ok().map(|&(_, f, _)| f)
 }
 
 fn create_fn() -> Result<CreateInstance, String> {
-    let &(_, f) = load()?;
+    let &(_, f, _) = load()?;
     Ok(unsafe { std::mem::transmute::<usize, CreateInstance>(f) })
+}
+
+/// DXC's allocator for one compiler: a heap of its own. DXC allocates through the process
+/// heap otherwise (CoTaskMemAlloc), under one lock: on Wine, 13–16 of 17 compile threads and
+/// the title's threads creating pipelines stood in RtlEnterCriticalSection under
+/// Rtl{Allocate,Free}Heap at any moment while GTA VI compiled its shaders – one or two
+/// compiles ran. The heap is serialized (a blob may be released on another thread) and
+/// lives for the process, like the compile thread it belongs to.
+#[repr(C)]
+struct HeapMalloc {
+    vtbl: *const MallocVtbl,
+    heap: usize,
+}
+
+#[repr(C)]
+struct MallocVtbl {
+    query_interface: unsafe extern "system" fn(*mut HeapMalloc, *const GUID, *mut *mut c_void) -> HRESULT,
+    add_ref: unsafe extern "system" fn(*mut HeapMalloc) -> u32,
+    release: unsafe extern "system" fn(*mut HeapMalloc) -> u32,
+    alloc: unsafe extern "system" fn(*mut HeapMalloc, usize) -> *mut c_void,
+    realloc: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void, usize) -> *mut c_void,
+    free: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void),
+    get_size: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void) -> usize,
+    did_alloc: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void) -> i32,
+    heap_minimize: unsafe extern "system" fn(*mut HeapMalloc),
+}
+
+const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+const IID_IMALLOC: GUID = GUID::from_u128(0x00000002_0000_0000_c000_000000000046);
+
+static MALLOC_VTBL: MallocVtbl = {
+    use windows_sys::Win32::System::Memory::{HeapAlloc, HeapFree, HeapReAlloc, HeapSize};
+    unsafe extern "system" fn query_interface(this: *mut HeapMalloc, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+        if ppv.is_null() {
+            return HRESULT(0x80004003u32 as i32); // E_POINTER
+        }
+        if !riid.is_null() && (*riid == IID_IUNKNOWN || *riid == IID_IMALLOC) {
+            *ppv = this as *mut c_void;
+            return HRESULT(0);
+        }
+        *ppv = std::ptr::null_mut();
+        HRESULT(0x80004002u32 as i32) // E_NOINTERFACE
+    }
+    // never freed: no count to keep
+    unsafe extern "system" fn add_ref(_this: *mut HeapMalloc) -> u32 {
+        2
+    }
+    unsafe extern "system" fn release(_this: *mut HeapMalloc) -> u32 {
+        1
+    }
+    unsafe extern "system" fn alloc(this: *mut HeapMalloc, n: usize) -> *mut c_void {
+        HeapAlloc((*this).heap as _, 0, n)
+    }
+    unsafe extern "system" fn realloc(this: *mut HeapMalloc, p: *mut c_void, n: usize) -> *mut c_void {
+        if p.is_null() {
+            return alloc(this, n);
+        }
+        if n == 0 {
+            free(this, p);
+            return std::ptr::null_mut();
+        }
+        HeapReAlloc((*this).heap as _, 0, p, n)
+    }
+    unsafe extern "system" fn free(this: *mut HeapMalloc, p: *mut c_void) {
+        if !p.is_null() {
+            HeapFree((*this).heap as _, 0, p);
+        }
+    }
+    unsafe extern "system" fn get_size(this: *mut HeapMalloc, p: *mut c_void) -> usize {
+        if p.is_null() {
+            return usize::MAX;
+        }
+        HeapSize((*this).heap as _, 0, p)
+    }
+    // -1: cannot tell
+    unsafe extern "system" fn did_alloc(_this: *mut HeapMalloc, _p: *mut c_void) -> i32 {
+        -1
+    }
+    unsafe extern "system" fn heap_minimize(_this: *mut HeapMalloc) {}
+    MallocVtbl { query_interface, add_ref, release, alloc, realloc, free, get_size, did_alloc, heap_minimize }
+};
+
+/// Whether each compiler gets a heap of its own: `XCL_DXC_HEAP=1` / `0`, else on Wine only
+/// (Windows' process heap does not serialize small allocations, and a heap per compile
+/// thread keeps what that thread freed).
+fn own_heaps(setting: Option<&str>, wine: bool) -> bool {
+    match setting {
+        Some("0") => false,
+        Some("1") => true,
+        _ => wine,
+    }
+}
+
+/// IMalloc for a new compiler (`HeapMalloc`), None when off or unavailable.
+fn compiler_malloc() -> Option<*mut c_void> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let wine = unsafe { GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some() };
+        let on = own_heaps(std::env::var("XCL_DXC_HEAP").ok().as_deref(), wine);
+        if on {
+            crate::xlog_info!("DXC: each compile thread allocates from a heap of its own (XCL_DXC_HEAP=0 for the process heap)");
+        }
+        on
+    });
+    if !on {
+        return None;
+    }
+    let heap = unsafe { windows_sys::Win32::System::Memory::HeapCreate(0, 0, 0) };
+    if heap.is_null() {
+        return None;
+    }
+    Some(Box::into_raw(Box::new(HeapMalloc { vtbl: &MALLOC_VTBL, heap: heap as usize })) as *mut c_void)
 }
 
 thread_local! {
@@ -93,7 +210,11 @@ fn compiler() -> Result<IDxcCompiler3, String> {
         }
         let create = create_fn()?;
         let mut p = std::ptr::null_mut();
-        let hr = unsafe { create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p) };
+        let create2 = load()?.2;
+        let hr = match (create2 != 0).then(compiler_malloc).flatten() {
+            Some(malloc) => unsafe { std::mem::transmute::<usize, CreateInstance2>(create2)(malloc, &CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p) },
+            None => unsafe { create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p) },
+        };
         if hr.is_err() || p.is_null() {
             return Err(format!("DxcCreateInstance: {hr:?}"));
         }
@@ -640,6 +761,53 @@ pub fn in_cached_only() -> bool {
 
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
     compile_cached_in(&cache_dir(), src, entry, profile)
+}
+
+#[cfg(test)]
+mod heap_tests {
+    use super::*;
+
+    #[test]
+    fn compilers_get_their_own_heap_on_wine_unless_told_otherwise() {
+        assert!(own_heaps(None, true));
+        assert!(!own_heaps(None, false));
+        assert!(own_heaps(Some("1"), false));
+        assert!(!own_heaps(Some("0"), true));
+        assert!(own_heaps(Some("yes"), true) && !own_heaps(Some("yes"), false));
+    }
+
+    #[test]
+    fn heap_malloc_is_an_imalloc() {
+        unsafe {
+            let heap = windows_sys::Win32::System::Memory::HeapCreate(0, 0, 0);
+            assert!(!heap.is_null());
+            let mut m = HeapMalloc { vtbl: &MALLOC_VTBL, heap: heap as usize };
+            let this = &mut m as *mut HeapMalloc;
+            let v = &*m.vtbl;
+            let mut out = std::ptr::null_mut();
+            assert_eq!((v.query_interface)(this, &IID_IMALLOC, &mut out), HRESULT(0));
+            assert_eq!(out, this as *mut c_void);
+            assert_eq!((v.query_interface)(this, &IID_IUNKNOWN, &mut out), HRESULT(0));
+            assert!((v.query_interface)(this, &IDxcCompiler3::IID, &mut out).is_err() && out.is_null());
+            let p = (v.alloc)(this, 100) as *mut u8;
+            assert!(!p.is_null() && (v.get_size)(this, p as *mut c_void) >= 100);
+            std::ptr::write_bytes(p, 0xAB, 100);
+            // grows with its contents; a null block is an allocation, size 0 a free
+            let q = (v.realloc)(this, p as *mut c_void, 1 << 20) as *mut u8;
+            assert!(!q.is_null() && std::slice::from_raw_parts(q, 100).iter().all(|&b| b == 0xAB));
+            assert!((v.realloc)(this, q as *mut c_void, 0).is_null());
+            let r = (v.realloc)(this, std::ptr::null_mut(), 16);
+            assert!(!r.is_null());
+            (v.free)(this, r);
+            (v.free)(this, std::ptr::null_mut());
+            assert_eq!((v.get_size)(this, std::ptr::null_mut()), usize::MAX);
+            // blocks of another thread's compiler are freed where they came from
+            let s = (v.alloc)(this, 64) as usize;
+            let at = this as usize;
+            std::thread::spawn(move || ((*(*(at as *mut HeapMalloc)).vtbl).free)(at as *mut HeapMalloc, s as *mut c_void)).join().unwrap();
+            assert_ne!(windows_sys::Win32::System::Memory::HeapDestroy(heap), 0);
+        }
+    }
 }
 
 #[cfg(test)]
