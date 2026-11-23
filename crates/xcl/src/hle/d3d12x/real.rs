@@ -1062,6 +1062,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (80, super::frame::wait_frame_event_x as usize),
                 (81, super::frame::frame_statistics_x as usize),
                 (86, x::create_pipeline_state_x as usize),
+                (101, x::create_state_object_x as usize),
                 (108, x::get_resource_allocation_info2_x as usize),
                 (127, dev_create_committed_resource_layout_x as usize),
                 (133, x::create_placed_resource_layout_x as usize),
