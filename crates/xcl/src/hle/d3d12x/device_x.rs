@@ -144,7 +144,7 @@ pub(super) unsafe extern "system" fn create_graphics_pso_x(this: *mut c_void, de
 /// device #10 CreateGraphicsPipelineState(desc, riid, pipeline): remembered as a base for
 /// derived pipelines and tagged with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when supported.
 pub(super) unsafe extern "system" fn create_graphics_pso_pc(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    create_graphics_pso_tracked(this, desc, riid, ppv)
+    create_graphics_pso_tracked(this, desc, None, riid, ppv)
 }
 
 /// Cached result of `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16).DynamicDepthBiasSupported`:
@@ -187,7 +187,8 @@ pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
 
 /// Create a graphics PSO, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when the
 /// device supports it (retrying without the flag if creation fails), and record it as a base.
-unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+/// `shaders`: the stage hashes when the caller has them (a derived pipeline has its base's).
+unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, shaders: Option<[u64; 5]>, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let mut used_dynamic = false;
     let hr = if !desc.is_null() && crate::gpu::shader::readable(desc as usize, GFX_DESC) {
         let orig = GfxDesc((desc as *const [u8; GFX_DESC]).read_unaligned());
@@ -211,7 +212,7 @@ unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, ri
         real::dev_create_graphics_pso(this, desc, riid, ppv)
     };
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        note_base(*ppv, desc, used_dynamic);
+        note_base(*ppv, desc, shaders, used_dynamic);
     }
     hr
 }
@@ -352,7 +353,7 @@ unsafe fn stage_hashes(d: &[u8; GFX_DESC]) -> Option<[u64; 5]> {
 }
 
 /// Remember a title graphics pipeline's description (not with stream output).
-unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: bool) {
+unsafe fn note_base(pso: *mut c_void, desc: *const c_void, shaders: Option<[u64; 5]>, dynamic_depth_bias: bool) {
     if pso.is_null() || desc.is_null() || !crate::gpu::shader::readable(desc as usize, GFX_DESC) {
         return;
     }
@@ -360,7 +361,7 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: b
     if rd32(&d.0, SO_ENTRIES) != 0 {
         return;
     }
-    let Some(shaders) = stage_hashes(&d.0) else { return };
+    let Some(shaders) = shaders.or_else(|| stage_hashes(&d.0)) else { return };
     let static_bias = DepthBias::from_desc(&d.0);
     let (p, n) = (rd64(&d.0, INPUT_LAYOUT) as usize, rd32(&d.0, INPUT_LAYOUT + 8) as usize);
     let (mut elems, mut names) = (Vec::new(), Vec::new());
@@ -561,7 +562,8 @@ pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, bas
         }
     }
     let desc = d.0.as_ptr() as *const c_void;
-    create_graphics_pso_tracked(this, desc, riid, ppv)
+    // the base's shaders, hashed just above
+    create_graphics_pso_tracked(this, desc, Some(b.shaders), riid, ppv)
 }
 
 /// device #86 CreatePipelineState(stream desc, riid, pipeline)
