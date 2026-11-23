@@ -3104,6 +3104,10 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     // a GPU with 32-lane waves runs a wave64 VS / PS in waves of 32: the lanes 32..63 it
     // reads come from `upper_lanes` (split_wave64)
     let split = wave32_only(this);
+    // where a pipeline's time goes, for the log line below: finding its shaders, the driver
+    static SHADERS_NS: AtomicU64 = AtomicU64::new(0);
+    static DRIVER_NS: AtomicU64 = AtomicU64::new(0);
+    let t0 = std::time::Instant::now();
     // the shaders stay the cache's (`console_to_dxil_shared`): no copy of the DXIL per pipeline
     let windows = mem_windows();
     let vs_c = match console_to_dxil_shared(vs, Stage::Vertex, 0, split, windows) {
@@ -3148,7 +3152,10 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
+    SHADERS_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
     let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    DRIVER_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
@@ -3216,8 +3223,11 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
             }
         }
     }
-    if n < 5 || n % 1000 == 0 {
+    if n < 5 {
         crate::xlog_info!("D3D12.X: graphics PSO from translated console shaders (#{})", n + 1);
+    } else if n % 1000 == 0 {
+        let ms = |ns: &AtomicU64| ns.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        crate::xlog_info!("D3D12.X: graphics PSO from translated console shaders (#{}; since the last line: {:.0} ms for their shaders, {:.0} ms in the driver)", n + 1, ms(&SHADERS_NS), ms(&DRIVER_NS));
     }
     Some(hr)
 }
