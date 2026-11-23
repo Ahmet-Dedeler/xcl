@@ -876,6 +876,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if !buffer && super::vram::gpu_owned(flags) {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, riid, ppv) {
+            static T: AtomicU64 = AtomicU64::new(0);
+            if super::title_textures::trace_unwatched() && once(&T, 600) {
+                crate::xlog_info!("title texture trace: GPU-owned texture {:p} at {va:#x}: {}x{}x{} mips {} format {} flags {:#x} state {state:#x} – video memory, frame {}", *ppv, pc.Width, pc.Height, pc.DepthOrArraySize, pc.MipLevels, pc.Format.0, pc.Flags.0, super::present::counters().1);
+            }
             return hr;
         }
     }
@@ -898,6 +902,13 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     }
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
+    }
+    {
+        static T: AtomicU64 = AtomicU64::new(0);
+        if super::title_textures::trace_unwatched() && once(&T, 600) {
+            let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+            crate::xlog_info!("title texture trace: resource of its own {:p} at {va:#x}: dimension {} {}x{} format {} flags {:#x} ({hr:#x}), frame {}", *ppv, w(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), w(0x18), w(0x20), w(0x30), super::present::counters().1);
+        }
     }
     if hr < 0 || once(&N, 4) {
         let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());

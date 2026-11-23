@@ -372,8 +372,17 @@ static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !super::present::trace_frame() {
+    if s.sampler || !(super::present::trace_frame() || super::present::trace_window_asked()) {
         return;
+    }
+    {
+        let mut g = BY_INDEX.lock().unwrap();
+        let m = g.get_or_insert_with(Default::default);
+        if res == 0 {
+            m.remove(&s.index);
+        } else {
+            m.insert(s.index, res);
+        }
     }
     let mut g = RES.lock().unwrap();
     let m = g.get_or_insert_with(Default::default);
@@ -382,6 +391,15 @@ pub fn note_resource(s: &Slot, res: usize) {
     } else {
         m.insert(s.at, res);
     }
+}
+
+/// PC heap index of a view (T# word 0 in XCL's ABI) → the resource it names: a T# copied by
+/// value into a table still names its resource (the traces)
+static BY_INDEX: Mutex<Option<std::collections::HashMap<u32, usize>>> = Mutex::new(None);
+
+/// The resource of the view with PC heap index `index` (the traces).
+pub fn resource_of_index(index: u32) -> Option<usize> {
+    BY_INDEX.lock().unwrap().as_ref()?.get(&index).copied()
 }
 
 /// The resource of the view slot at UMA address `at`.

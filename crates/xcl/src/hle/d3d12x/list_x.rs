@@ -2344,6 +2344,23 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
             }
         }
     }
+    if super::title_textures::trace_unwatched() && super::present::counters().1 >= 1400 {
+        static T: AtomicU64 = AtomicU64::new(0);
+        if let (Some(d), Some(sl)) = (dst.as_ref(), src.as_ref()) {
+            let (dr, sr): (usize, usize) = (transmute_copy(&d.pResource), transmute_copy(&sl.pResource));
+            let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0) });
+            let k = T.fetch_add(1, Ordering::Relaxed);
+            if k < 400 || k.is_power_of_two() {
+                let fp = |l: &D3D12_TEXTURE_COPY_LOCATION| if l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT { let f = l.Anonymous.PlacedFootprint; format!("footprint (offset {:#x}, format {}, {}x{}, pitch {})", f.Offset, f.Footprint.Format.0, f.Footprint.Width, f.Footprint.Height, f.Footprint.RowPitch) } else { format!("subresource {}", l.Anonymous.SubresourceIndex) };
+                let addr = |r: usize| real::title_address(r).or_else(|| super::title_textures::address(r)).or_else(|| super::vram::address(r));
+                crate::xlog_info!(
+                    "title texture trace: CopyTextureRegion #{k} frame {}: dst {dr:#x} {:?} at {:x?} {} ({x}, {y}, {z}) ← src {sr:#x} {:?} at {:x?} {} box {:?}",
+                    super::present::counters().1, desc(dr), addr(dr), fp(d), desc(sr), addr(sr), fp(sl),
+                    bx.as_ref().map(|b| (b.left, b.top, b.right, b.bottom))
+                );
+            }
+        }
+    }
     if let Some(l) = dst.as_ref().filter(|l| l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
         // (the rows of the footprint: at most what the copy writes)
         let f = &l.Anonymous.PlacedFootprint;

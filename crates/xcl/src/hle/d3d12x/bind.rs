@@ -313,6 +313,9 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
     }
+    if super::present::trace_window() {
+        trace_window_call(this, pso, true, &format!("draw {:?}", DRAW_ARGS.with(|d| d.get())));
+    }
     match bind_abi(this, &list, pso, true) {
         Ok(()) => {
             count(DRAWS);
@@ -504,6 +507,95 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
             super::list_x::geometry_summary(this, args)
         );
     }
+}
+
+/// A resource for the traces: its description and where the title has it.
+unsafe fn resource_summary(r: usize) -> String {
+    let d = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc());
+    let place = if let Some(a) = super::title_textures::address(r) {
+        format!(" title memory {a:#x}")
+    } else if let Some(a) = super::vram::address(r) {
+        format!(" video memory for {a:#x}")
+    } else if let Some(a) = super::real::title_address(r) {
+        format!(" own resource for {a:#x}")
+    } else if let Some((a, n)) = super::real::console_buffer(r) {
+        format!(" unified memory {a:#x}+{n:#x}")
+    } else {
+        String::new()
+    };
+    format!("{r:#x} {:?}{place}", d.map(|d| (d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.Flags.0)))
+}
+
+/// `XCL_TRACE_WINDOW` (`present::trace_window`): a draw or dispatch with a translated pipeline
+/// – its shaders, target, root constants, root buffers (where they are, their first words) and
+/// what its descriptor tables hold: the first slots, and the slots that small values among its
+/// constants and buffer words name (a bindless title passes indices).
+unsafe fn trace_window_call(this: *mut c_void, pso: usize, gfx: bool, what: &str) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 240 {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    let Some(layout) = layout else {
+        crate::xlog_info!("window trace: {what} pipeline {pso:#x}: no root signature layout");
+        return;
+    };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mut out: Vec<String> = Vec::new();
+    let mut tables: Vec<usize> = Vec::new();
+    let mut values: Vec<u32> = Vec::new();
+    for (i, p) in layout.params.iter().enumerate() {
+        match *p {
+            Param::Constants { at, count } => {
+                let w: Vec<u32> = (0..count.min(24) as usize).map(|k| word(at as usize + 4 * k)).collect();
+                out.push(format!("p{i} constants {w:x?}"));
+                values.extend(&w);
+            }
+            Param::Descriptor { at } => {
+                let va = (word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32) as usize;
+                let w: Vec<u32> = if va != 0 && crate::gpu::shader::readable(va, 4 * 24) { (0..24).map(|k| ((va + 4 * k) as *const u32).read_unaligned()).collect() } else { Vec::new() };
+                out.push(format!("p{i} buffer {va:#x} (window {:?}) {w:x?}", u.window_of(va)));
+                values.extend(&w);
+            }
+            Param::Table { at } => {
+                let t = word(at as usize) as usize;
+                let slots: Vec<String> = (0..12usize)
+                    .filter_map(|k| {
+                        let w = super::console_heap::words_at((t + 32 * k) as u32)?;
+                        if w.iter().all(|&x| x == 0) {
+                            return None;
+                        }
+                        // a view slot, or an image descriptor copied in by value
+                        let r = super::console_heap::resource_at(u.base() + t + 32 * k).or_else(|| if w[3] & 0xFFF == 0xFAC { super::console_heap::resource_of_index(w[0]) } else { None });
+                        Some(match r {
+                            Some(r) => format!("[{k}] {}{} {:x?}", resource_summary(r), super::title_textures::memory_summary(r), &w[..4]),
+                            None => format!("[{k}] {w:x?}"),
+                        })
+                    })
+                    .collect();
+                out.push(format!("p{i} table {t:#x}: {}", slots.join(", ")));
+                tables.push(t);
+            }
+        }
+    }
+    let mut named: Vec<String> = Vec::new();
+    let mut seen: Vec<usize> = Vec::new();
+    for &v in values.iter().filter(|&&v| v < 1 << 20) {
+        for &t in &tables {
+            let at = u.base() + t + 32 * v as usize;
+            if let Some(r) = super::console_heap::resource_at(at) {
+                if !seen.contains(&at) && seen.len() < 24 {
+                    seen.push(at);
+                    named.push(format!("[{v}] {}", resource_summary(r)));
+                }
+            }
+        }
+    }
+    let real = super::pso_async::resolve(pso);
+    let shaders = super::real::pso_shaders(real).map(|(v, p)| format!(" vs {v:016x} ps {p:016x}")).unwrap_or_default();
+    let target = if gfx { super::present::rt0_resource(this as usize).map(|r| format!(" into {}{}", resource_summary(r), if super::present::is_presented(r) { " (presented)" } else { "" })).unwrap_or_default() } else { String::new() };
+    crate::xlog_info!("window trace: frame {} {what} pipeline {real:#x}{shaders}{target}: {}; indices name: {}", super::present::counters().1, out.join("; "), named.join("; "));
 }
 
 /// A draw's root arguments for the frame trace: constants, root buffers (their first words, as
@@ -721,6 +813,9 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
+    }
+    if super::present::trace_window() {
+        trace_window_call(this, pso, false, &format!("dispatch ({x}, {y}, {z})"));
     }
     bind_abi(this, list, pso, false)?;
     list.Dispatch(x, y, z);

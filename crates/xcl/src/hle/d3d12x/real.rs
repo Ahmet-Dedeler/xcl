@@ -1169,6 +1169,13 @@ static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
     let Some((at, bytes)) = console_buffer(res) else {
         note_buffer_view();
+        if super::present::trace_window() {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 80 {
+                let d = unsafe { ID3D12Resource::from_raw_borrowed(&(res as *mut c_void)).map(|r| r.GetDesc()) };
+                crate::xlog_info!("window trace: buffer view (first {first}, {n} elements of {stride}, raw {raw}) of {res:#x} {:?} for title address {:x?}: not in unified memory – an empty V#", d.map(|d| (d.Width, d.Flags.0)), title_address(res));
+            }
+        }
         return [0; 4];
     };
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
@@ -1545,6 +1552,8 @@ static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c_void) {
     if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
+        // (a texture kept in step with title memory: what was written while it was mapped)
+        super::title_textures::note_unmap(this as usize);
         return;
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
@@ -1703,6 +1712,12 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
     if !in_uma {
         note_buffer_view();
+        if super::present::trace_window() {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                crate::xlog_info!("window trace: constant buffer view of {size} bytes at {va:#x}: not in unified memory – an empty V#");
+            }
+        }
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
     super::console_heap::write(&slot, &crate::gpu::desc::buffer_words(va, 0, size, 22));

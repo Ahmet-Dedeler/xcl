@@ -299,6 +299,15 @@ fn merge_host_inputs(
     s.buttons |= read_scripted();
 }
 
+/// when the title first saw a button down (seconds since the host started)
+static FIRST_PRESS: OnceLock<f64> = OnceLock::new();
+
+/// Seconds since the host started at which the title first saw a button down (None: not yet)
+/// – what `XCL_TRACE_WINDOW` counts from.
+pub fn first_press() -> Option<f64> {
+    FIRST_PRESS.get().copied()
+}
+
 /// the gamepad now
 pub fn poll() -> GamepadState {
     let mut s = xinput_pad().unwrap_or_default();
@@ -318,6 +327,7 @@ pub fn poll() -> GamepadState {
         let new = s.buttons & !SEEN.fetch_or(s.buttons, Ordering::Relaxed);
         if new != 0 {
             crate::xlog_info!("GameInput: gamepad buttons {new:#x} pressed for the first time");
+            FIRST_PRESS.get_or_init(crate::log::uptime);
         }
     }
     s

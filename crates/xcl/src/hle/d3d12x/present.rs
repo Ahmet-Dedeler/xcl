@@ -181,6 +181,31 @@ pub fn trace_frame() -> bool {
     *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FRAME").is_some())
 }
 
+/// `XCL_TRACE_WINDOW=a,b`: between `a` and `b` seconds after the title first saw a gamepad
+/// button down (`XCL_PRESS_AT`: a scripted press starts a video or opens a page), every draw
+/// and dispatch with a translated pipeline is logged with its root arguments and the resources
+/// its descriptor tables name (`bind::trace_window_call`; the first 240), and buffer views of
+/// memory outside unified memory. No GPU work of its own, so it goes with `XCL_FRAME_DUMP`.
+/// Whether `XCL_TRACE_WINDOW` is set (what the window's lines need is noted from the start).
+pub fn trace_window_asked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_TRACE_WINDOW").is_some())
+}
+
+pub fn trace_window() -> bool {
+    static W: std::sync::OnceLock<Option<(f64, f64)>> = std::sync::OnceLock::new();
+    let Some((a, b)) = *W.get_or_init(|| {
+        let v = std::env::var("XCL_TRACE_WINDOW").ok()?;
+        let (a, b) = v.split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }) else {
+        return false;
+    };
+    let Some(t0) = crate::hle::gameinput::first_press() else { return false };
+    let t = crate::log::uptime() - t0;
+    t >= a && t < b
+}
+
 /// `res` was used as `what` (USE_*)
 pub fn note_use(res: usize, what: usize) {
     if trace_frame() && res != 0 {
