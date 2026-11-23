@@ -3021,6 +3021,13 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
         // Submit 1: reads slot 0 -> in_a (sparse VRAM) + arg_table constant 77 (Window 3)
         record_and_run(1, true);
+        // a window the GPU has a copy of: what the shader stored comes back on request
+        let gpu_wrote = || {
+            if u.shadowed() {
+                crate::hle::d3d12x::sparse::readback_now(out_buf, 256);
+            }
+        };
+        gpu_wrote();
         for l in 0..64usize {
             let got = *((out_buf + 4 * l) as *const u32);
             assert_eq!(got, 1000 + l as u32 + 77, "submit 1 lane {l} mismatch");
@@ -3031,10 +3038,19 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         *((in_b + 4 * 3) as *mut u32) = 9999;
         crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_b));
         record_and_run(2, false);
+        gpu_wrote();
         for l in 0..64usize {
             let expected = if l == 3 { 9999 + 13 } else { 5000 + 2 * l as u32 + 13 };
             let got = *((out_buf + 4 * l) as *const u32);
             assert_eq!(got, expected, "submit 2 (mutated sparse descriptor + XMem buffer) lane {l} mismatch");
+        }
+
+        // Submits 3..: a constant the CPU rewrites before every submit reaches the shader each time
+        for n in 0..40u32 {
+            *(arg_table as *mut u32) = 100 + n;
+            record_and_run(3 + n as u64, false);
+            gpu_wrote();
+            assert_eq!(*(out_buf as *const u32), 5000 + 100 + n, "submit {} (constant rewritten in window 3)", 3 + n);
         }
 
         // Clean up

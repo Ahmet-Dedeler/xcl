@@ -13,6 +13,7 @@
 //! 4095 MiB works (exactly 4 GiB is rejected), opening 4 GiB takes ~0.5 s.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
@@ -52,6 +53,8 @@ pub struct Uma {
     /// cannot take it – a title that commits all of unified memory at start (Unicorn
     /// Overlord: 2046 of 2048 MB) left no room for draw arguments, and draws were skipped.
     pool: Mutex<(usize, usize, Vec<usize>)>,
+    /// the committed windows are not the GPU's memory: it has copies of them (`set_shadowed`)
+    shadowed: AtomicBool,
 }
 
 /// bytes of XCL's arena pool (`Uma::new`)
@@ -193,6 +196,7 @@ impl Uma {
                 inner: Mutex::new(inner),
                 sparse_free: Mutex::new(sparse_free),
                 pool: Mutex::new((0, 0, Vec::new())),
+                shadowed: AtomicBool::new(false),
             };
             u.reserve_pool(POOL);
             return Some(u);
@@ -263,6 +267,23 @@ impl Uma {
     /// Whether `p` is in a committed window.
     pub fn is_committed(&self, p: usize) -> bool {
         self.window_of(p).is_some_and(|k| self.is_committed_window(k))
+    }
+
+    /// The GPU could not open the committed windows as heaps (`OpenExistingHeapFromAddress`
+    /// not implemented: D3DMetal): each has a buffer in video memory instead, a copy that
+    /// `d3d12x::sparse` keeps in step like a sparse window's tiles.
+    pub fn set_shadowed(&self) {
+        self.shadowed.store(true, Ordering::Release);
+    }
+
+    pub fn shadowed(&self) -> bool {
+        self.shadowed.load(Ordering::Acquire)
+    }
+
+    /// Whether the GPU works on a copy of the memory at `p` (a sparse window, or a committed
+    /// one that is shadowed): what the GPU writes there the CPU sees only after a readback.
+    pub fn is_gpu_copy(&self, p: usize) -> bool {
+        self.is_sparse(p) || (self.shadowed() && self.is_committed(p))
     }
 
     /// Address space for a title reservation of `size` bytes in the sparse windows (64 KiB
@@ -392,6 +413,7 @@ impl Uma {
                     inner: Mutex::new(inner),
                     sparse_free: Mutex::new(Default::default()),
                     pool: Mutex::new((0, 0, Vec::new())),
+                    shadowed: AtomicBool::new(false),
                 });
             }
             for p in got {
