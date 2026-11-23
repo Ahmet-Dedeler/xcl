@@ -396,7 +396,7 @@ fn window_thread() {
             WINDOW_EX_STYLE(0),
             class,
             &HSTRING::from(format!("XCL – {title}")),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            if crate::hle::kbm::background() { WS_OVERLAPPEDWINDOW } else { WS_OVERLAPPEDWINDOW | WS_VISIBLE },
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             rc.right - rc.left,
@@ -410,6 +410,11 @@ fn window_thread() {
             crate::xlog_error!("could not create the XCL window");
             return;
         };
+        if crate::hle::kbm::background() {
+            // shown behind the program in front, without becoming the active window
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
         crate::hle::kbm::attach(hwnd.0);
