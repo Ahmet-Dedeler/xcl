@@ -4077,7 +4077,7 @@ unsafe fn view_format_for(res: *mut c_void, format: i32, depth_view: bool) -> i3
     let other_family = matches!(vf, 39..=41 | 53..=56);
     let fixed = match rf {
         19..=22 if other_family => if depth_view { 20 } else { 21 },
-        44..=47 if other_family => if depth_view { 45 } else { 46 },
+        44..=47 if other_family || vf == 44 => if depth_view { 45 } else { 46 },
         _ => vf,
     };
     if fixed != format {

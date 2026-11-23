@@ -689,7 +689,10 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     let pc_flags = if flags & 0x2 != 0 { flags & 0xFF & !0x4 } else { flags & 0xFF };
     d[0x30..0x34].copy_from_slice(&pc_flags.to_le_bytes());
     let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
-    d[0x20..0x24].copy_from_slice(&pc_format(format).to_le_bytes());
+    // the resource itself is typeless (the console reads its depth buffers through views of the
+    // depth and of the stencil plane; D3DMetal makes those only of a typeless resource)
+    let pc = if matches!(format, 118..=120) { 44 } else { format };
+    d[0x20..0x24].copy_from_slice(&pc.to_le_bytes());
     d
 }
 
@@ -814,6 +817,16 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         return E_INVALIDARG;
     }
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    // a clear value in a console-only depth format: the PC's typed one (D3D12_CLEAR_VALUE is
+    // a format and 16 bytes)
+    let mut clear_pc = [0u8; 20];
+    let clear = if !clear.is_null() && crate::gpu::shader::readable(clear as usize, 20) && matches!(*(clear as *const u32), 118..=120) {
+        clear_pc = (clear as *const [u8; 20]).read_unaligned();
+        clear_pc[..4].copy_from_slice(&45u32.to_le_bytes());
+        clear_pc.as_ptr() as *const c_void
+    } else {
+        clear
+    };
     let d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     note_alias(va as usize, &x);
@@ -970,7 +983,7 @@ mod tests {
         x[0x30..0x34].copy_from_slice(&0x8030_0006u32.to_le_bytes()); // depth + UAV + console bits
         let d = pc_resource_desc(&x);
         let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
-        assert_eq!((u(0x20), u(0x30)), (45, 0x2));
+        assert_eq!((u(0x20), u(0x30)), (44, 0x2));
         x[0x30..0x34].copy_from_slice(&0x4u32.to_le_bytes()); // a UAV texture keeps it
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x30..0x34].try_into().unwrap()), 0x4);
         assert_eq!((pc_format(119), pc_format(120), pc_format(28)), (46, 47, 28));
