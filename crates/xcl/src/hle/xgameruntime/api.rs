@@ -85,6 +85,7 @@ const XSYSTEM_V3_IID: Guid = g(0x6fd71f09_7513_49f0_89bc_bfaf5df6f852);
 const XANALYTICS: Guid = g(0xb884675d_b738_4a9c_815d_9a9a1e0c6c9b);
 const XFEATURE: Guid = g(0x8836fe87_edb9_4fe3_8dad_05f0d2cd5b40);
 const XDISPLAY: Guid = g(0x1b339674_328d_4283_a200_3171f18d3639);
+const XDISPLAY_HDR: Guid = g(0x03f0fe74_fdd9_4e5c_b630_f9339c47acc5);
 const XGAMEEVENT: Guid = g(0xbbfbdcc7_bfe7_409b_a5ca_edf054960b4d);
 pub const XNETWORKING: Guid = g(0x37e56907_2f10_41e8_b72f_36edb185331a);
 pub const XERROR: Guid = g(0x8ca467f7_22e8_4096_8456_bb8aa13f79d8);
@@ -361,7 +362,10 @@ struct Obj {
 unsafe impl Sync for Obj {}
 unsafe impl Send for Obj {}
 
-const SLOTS: usize = 96;
+/// Methods of an XCL object's vtable. The GDK table's highest slot is 83 (XStore); a title
+/// built with a newer GDK than the table calls later ones (another runtime's notes on a retail
+/// game: proxies need 128) – those reach `unknown_slot`, not the memory after the table.
+const SLOTS: usize = 128;
 
 unsafe extern "system" fn query_interface(this: *const Obj, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() || iid.is_null() {
@@ -449,7 +453,8 @@ macro_rules! per_slot {
 }
 per_slot!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
     40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79
-    80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95);
+    80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113
+    114 115 116 117 118 119 120 121 122 123 124 125 126 127);
 
 fn object(iface: Iface) -> &'static Obj {
     let mut v: Vec<usize> = (0..SLOTS).map(|k| STUBS[k] as usize).collect();
@@ -527,6 +532,7 @@ fn classes() -> Vec<Class> {
                 impls: vec![("XLaunchUri", launch_uri as usize), ("XDisplayAcquireTimeoutDeferral", display_deferral as usize), ("XDisplayCloseTimeoutDeferralHandle", nothing as usize)],
                 forward: &[],
             },
+            Class { name: "XDisplay (HDR)", clsid: XDISPLAY_HDR, impls: vec![("XDisplayTryEnableHdrMode", display_hdr as usize)], forward: &[] },
             // telemetry: offline, accepted and dropped
             Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", ok as usize)], forward: &[] },
             Class { name: "XNetworking", clsid: XNETWORKING, impls: xnetworking(), forward: &[] },
@@ -993,6 +999,16 @@ unsafe extern "system" fn display_deferral(out: *mut usize) -> HRESULT {
     }
     *out = 1;
     S_OK
+}
+
+/// XDisplayTryEnableHdrMode(preference, XDisplayHdrModeInfo* info) → XDisplayHdrModeResult:
+/// Disabled (2) – XCL presents SDR. A retail game asks at start; with the class missing its GDK
+/// thunk reported 0x89240107 ("XGameRuntime is missing required dependencies").
+unsafe extern "system" fn display_hdr(_preference: u32, info: *mut [f32; 3]) -> u32 {
+    if !info.is_null() {
+        info.write_unaligned([0.0; 3]); // min / max / max full-frame tone-map luminance
+    }
+    2
 }
 
 static PICTURE_ID: u8 = 0;
@@ -1924,6 +1940,12 @@ mod tests {
             true
         }
         unsafe {
+            // XDisplayTryEnableHdrMode (slot 4 of its own class): Disabled, the info cleared
+            let (hr, display) = query(XDISPLAY_HDR, g(0x35f07670_706e_4bfb_9476_090798c5ebf3));
+            assert_eq!(hr, S_OK);
+            let hdr: unsafe extern "system" fn(*mut c_void, u32, *mut [f32; 3]) -> u32 = slot(display, 4);
+            let mut info = [1.0f32; 3];
+            assert_eq!((hdr(display, 1, &mut info), info), (2, [0.0; 3]));
             // Both XNetworking CLSID and v2 IID resolve to XCL's XNetworking object.
             let (hr, net) = query(XNETWORKING, XNETWORKING);
             assert_eq!(hr, S_OK);

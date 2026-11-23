@@ -56,6 +56,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemMapPhysicalPagesScatter,
         XMemFreePhysicalPages,
         XMemTransferMemory,
+        XMemIsToolsMemAvailable,
         XMemGetWorkingSetStatistics,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
@@ -1283,15 +1284,24 @@ pub unsafe extern "system" fn XMemAllocatePhysicalPages(_attrs: u64, num: *mut u
     AllocateTitlePhysicalPages(std::mem::zeroed(), 0, num, arr as *mut usize)
 }
 
+/// `BOOL XMemIsToolsMemAvailable()`: whether the tools pool of a development kit is there. A
+/// retail game stops at an int3 on FALSE (exe+0x2215fe0, before it reads its working-set
+/// statistics); there is one budget here, so the tools' part of it is available.
+pub unsafe extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
+    1
+}
+
 /// `void* XMemMapPhysicalPages(void* address, SIZE_T count, ULONG64* pages)`
 pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, arr: *mut u64) -> *mut c_void {
     MapTitlePhysicalPages(va, n, 0, 0, arr as *mut usize)
 }
 
 /// `BOOL XMemMapPhysicalPagesScatter(void** addresses, SIZE_T count, ULONG64* pages)`: one 64 KiB
-/// page at each address (page 0: the address is unmapped)
+/// page at each address (page 0: the address is unmapped; no page array: all of them are – a
+/// retail game gives its page pool's pages back that way and stops at an int3 on FALSE,
+/// exe+0xb18de7)
 pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut c_void, n: usize, pages: *mut u64) -> BOOL {
-    if addresses.is_null() || pages.is_null() {
+    if addresses.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -1301,8 +1311,10 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
+    let page = |i: usize| if pages.is_null() { std::ptr::null_mut() } else { pages.add(i) as *mut usize };
+    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, page(i)).is_null());
     give_back_homes(away);
+    tell_arrived(away);
     ok as BOOL
 }
 
@@ -2021,6 +2033,11 @@ mod tests {
             let at = [page_home(pages[0]).unwrap(), page_home(pages[2]).unwrap()].map(|a| a as *mut c_void);
             let mut ids = [pages[0] as u64, pages[2] as u64];
             assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            // no page array: the addresses are unmapped (and can be mapped again)
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 2, std::ptr::null_mut()), 1);
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            assert_eq!(XMemMapPhysicalPagesScatter(std::ptr::null(), 2, std::ptr::null_mut()), 0);
+            assert_eq!(XMemIsToolsMemAvailable(), 1);
             ids[1] += 1;
             assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 2, ids.as_mut_ptr()), 0, "not a page number");
             // Page numbers must refer to one registered allocation; arithmetic is checked before
