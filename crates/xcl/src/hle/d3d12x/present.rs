@@ -190,6 +190,16 @@ pub fn note_use(res: usize, what: usize) {
     }
 }
 
+/// A resource is gone: the frame trace's counts and the presented list no longer name it (the
+/// busiest target's GetDesc at a frame dump went through a freed object – GTA VI replaces its
+/// UI target when its front end starts).
+pub fn forget(res: usize) {
+    if let Some(m) = USES.lock().unwrap().as_mut() {
+        m.remove(&res);
+    }
+    PRESENTED.lock().unwrap().retain(|&r| r != res);
+}
+
 /// resources the title presented
 static PRESENTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
@@ -434,7 +444,7 @@ fn window_thread() {
             WINDOW_EX_STYLE(0),
             class,
             &HSTRING::from(format!("XCL – {title}")),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            if crate::hle::kbm::background() { WS_OVERLAPPEDWINDOW } else { WS_OVERLAPPEDWINDOW | WS_VISIBLE },
             x,
             y,
             w,
@@ -448,6 +458,11 @@ fn window_thread() {
             crate::xlog_error!("could not create the XCL window");
             return;
         };
+        if crate::hle::kbm::background() {
+            // shown behind the program in front, without becoming the active window
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
         crate::hle::kbm::attach(hwnd.0);
@@ -781,7 +796,9 @@ fn frame_dump_due() -> bool {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    // the first frames too: a title under bring-up may never reach its 20th
+    let n = PRESENTS.load(Ordering::Relaxed);
+    every > 0 && (n < 4 || n % every == 20.min(every - 1))
 }
 
 /// Frames shown so far.
