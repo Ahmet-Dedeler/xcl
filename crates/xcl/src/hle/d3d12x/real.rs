@@ -3039,7 +3039,7 @@ impl Drop for SlotGuard {
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2 };
 
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
-    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_to_dxil_shared, is_console, mem_windows, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -3048,7 +3048,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if !is_console(cs) {
         return None;
     }
-    let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
+    let compiled = match console_to_dxil_shared(cs, Stage::Compute, 0, wave32_only(this), mem_windows()) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
@@ -3067,7 +3067,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    copy.CS = bytecode(&dxil);
+    copy.CS = bytecode(dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
     let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| (BIG_COMPILES.acquire(), crate::gpu::recomp::dxc::wait_for_memory()));
@@ -3084,7 +3084,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_to_dxil_shared, is_console, mem_windows, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -3104,37 +3104,44 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     // a GPU with 32-lane waves runs a wave64 VS / PS in waves of 32: the lanes 32..63 it
     // reads come from `upper_lanes` (split_wave64)
     let split = wave32_only(this);
-    let vs_c = match console_to_dxil_for(vs, Stage::Vertex, 0, split) {
+    // the shaders stay the cache's (`console_to_dxil_shared`): no copy of the DXIL per pipeline
+    let windows = mem_windows();
+    let vs_c = match console_to_dxil_shared(vs, Stage::Vertex, 0, split, windows) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("VS: {e}"));
             return None;
         }
     };
-    let mut samplers = vs_c.samplers;
-    let vs_dxil = vs_c.dxil;
-    let ps_dxil = match shader_bytes(&d.PS) {
-        Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
+    let mut samplers = vs_c.samplers.clone();
+    let vs_dxil = &vs_c.dxil;
+    let ps = shader_bytes(&d.PS);
+    let ps_c = match ps.filter(|p| is_console(p)) {
+        Some(p) => match console_to_dxil_shared(p, Stage::Pixel, samplers.len() as u32, split, windows) {
             Ok(b) => {
-                samplers.extend(b.samplers);
-                Some(b.dxil)
+                samplers.extend(b.samplers.iter().copied());
+                Some(b)
             }
             Err(e) => {
                 note_translation_error(format!("PS: {e}"));
                 return None;
             }
         },
-        Some(p) => Some(p.to_vec()),
         None => None,
     };
+    // a PC pixel shader is the title's own
+    let ps_dxil: Option<&[u8]> = ps_c.as_ref().map(|c| c.dxil.as_slice()).or(ps);
     let rs = abi_rs_for(this, &samplers)?;
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    copy.VS = bytecode(&vs_dxil);
-    copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
+    copy.VS = bytecode(vs_dxil);
+    copy.PS = ps_dxil.map(bytecode).unwrap_or_default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     pc_topology_type(&mut copy);
-    let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
+    // the PS is hashed only when a debug switch that asks for it is set
+    static DEBUG_SWITCHES: OnceLock<bool> = OnceLock::new();
+    let debug = *DEBUG_SWITCHES.get_or_init(|| ["XCL_DEBUG_NO_STENCIL", "XCL_DEBUG_NO_CULL"].iter().any(|v| std::env::var_os(v).is_some()));
+    let ps_hash = if debug { ps.map_or(0, crate::gpu::shader::fnv64) } else { 0 };
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
         copy.DepthStencilState.StencilEnable = false.into();
     }

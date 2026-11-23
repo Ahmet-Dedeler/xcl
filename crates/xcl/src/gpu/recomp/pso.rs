@@ -109,8 +109,15 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    console_to_dxil_shared(blob, stage, sampler_base, split_wave64, windows).map(|shader| shader.as_ref().clone())
+}
+
+/// `console_to_dxil_in` without a copy of the DXIL: the pipelines of a shader (a retail
+/// game: tens per pixel shader, clones with other fixed-function state) build from the one
+/// in `ShaderCache`.
+pub fn console_to_dxil_shared(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Arc<Compiled>, String> {
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+        return compile_console_shader(blob, stage, sampler_base, windows, split_wave64).map(Arc::new);
     }
     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
     static TRANSLATED: OnceLock<Mutex<HashMap<TranslatedKey, Arc<Translated>>>> = OnceLock::new();
@@ -129,7 +136,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     // without the debug switches (`cache_allowed`) this is `compile_console_shader`
     let compile_one = || translated_dxil(translated, known, &dir, || console_translation(blob, stage, sampler_base, windows, split_wave64).map(|(t, profile)| (t.hlsl, profile, t.static_samplers)));
     let from_disk = || translated::cached(&dir, blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    cached_shader(cache, key, blob, from_disk)
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
