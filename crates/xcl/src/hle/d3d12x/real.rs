@@ -4251,6 +4251,15 @@ unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, de
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
+    // a console-only format in the view's description: the PC's (as the resource got it)
+    let mut pc_desc = [0u32; 8];
+    let desc = if !desc.is_null() && super::device_x::pc_format(*(desc as *const u32)) != *(desc as *const u32) {
+        pc_desc = (desc as *const [u32; 8]).read_unaligned();
+        pc_desc[0] = super::device_x::pc_format(pc_desc[0]);
+        pc_desc.as_ptr() as *const c_void
+    } else {
+        desc
+    };
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
     if super::present::trace_frame() {
