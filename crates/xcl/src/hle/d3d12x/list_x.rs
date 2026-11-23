@@ -1618,7 +1618,77 @@ fn pc_va(va: u64) -> u64 {
     real::uma_va_of(va as usize).unwrap_or(va)
 }
 
+/// The last index buffer view given to the PC list (address, bytes) and the title's address
+/// of it: a host that cannot find the address ends in an access violation (D3DMetal), and the
+/// unhandled exception names these.
+pub static LAST_INDEX_VIEW: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// copies of index data the title keeps in ordinary memory: (address, bytes, hash of the
+/// contents, upload buffer, its GPU address)
+static CPU_INDICES: Mutex<Vec<(u64, u32, u64, ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+
+/// An index buffer view of ordinary process memory (not unified memory, no PC resource): the
+/// console's GPU reads any address of the title, a PC GPU does not – a Windows driver reads
+/// nothing there, D3DMetal looks the address up, finds no buffer and ends the process (GTA VI:
+/// 393216 bytes of 16-bit indices on its heap). The indices are copied to an upload buffer,
+/// one per address, size and contents (a copy a recorded draw uses is never rewritten).
+unsafe fn cpu_index_view(list: *mut c_void, v: &D3D12_INDEX_BUFFER_VIEW) -> Option<D3D12_INDEX_BUFFER_VIEW> {
+    let (va, n) = (v.BufferLocation, v.SizeInBytes);
+    if !crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed) || va == 0 || n == 0 || va >= 1 << 40 || n > 64 << 20 {
+        return None;
+    }
+    if crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, n as usize) {
+        return None;
+    }
+    let data = std::slice::from_raw_parts(va as *const u8, n as usize);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for c in data.chunks(8) {
+        let mut w = [0u8; 8];
+        w[..c.len()].copy_from_slice(c);
+        hash = (hash ^ u64::from_le_bytes(w)).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
+    }
+    let mut cache = CPU_INDICES.lock().unwrap();
+    if let Some(e) = cache.iter().find(|e| e.0 == va && e.1 == n && e.2 == hash) {
+        return Some(D3D12_INDEX_BUFFER_VIEW { BufferLocation: e.4, ..*v });
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if once(&N, 8) {
+        crate::xlog_warn!("D3D12.X: IASetIndexBuffer: {n} bytes at {va:#x} are ordinary memory, not unified memory – the indices are copied to an upload buffer (first bytes {:02x?})", &data[..data.len().min(16)]);
+    }
+    // contents that keep changing: the oldest copies go (a list recorded long ago may name one)
+    if cache.len() >= 256 {
+        cache.drain(..64);
+    }
+    let dev = device_of(list)?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: (n as u64).next_multiple_of(0x1_0000),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut b: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut b).ok()?;
+    let b = b?;
+    let mut p: *mut c_void = std::ptr::null_mut();
+    b.Map(0, None, Some(&mut p)).ok()?;
+    std::ptr::copy_nonoverlapping(data.as_ptr(), p as *mut u8, data.len());
+    b.Unmap(0, None);
+    let gpu = b.GetGPUVirtualAddress();
+    cache.push((va, n, hash, b, gpu));
+    Some(D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu, ..*v })
+}
+
 unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_VIEW>) {
+    let copy = view.and_then(|v| cpu_index_view(list, v));
+    let view = copy.as_ref().or(view);
+    if let Some(v) = view {
+        LAST_INDEX_VIEW[0].store(v.BufferLocation, Ordering::Relaxed);
+        LAST_INDEX_VIEW[1].store(v.SizeInBytes as u64, Ordering::Relaxed);
+    }
     let f = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW)>(list, PC_IA_SET_INDEX_BUFFER);
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
 }
@@ -1728,6 +1798,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     }
     let mut v = view.read_unaligned();
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
+    LAST_INDEX_VIEW[2].store(v.BufferLocation, Ordering::Relaxed);
     v.BufferLocation = pc_va(v.BufferLocation);
     s.index_buffer = Some(v);
     drop(g);
