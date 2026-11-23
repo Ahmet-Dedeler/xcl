@@ -1665,6 +1665,14 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     if let Some((p, _)) = console_buffer(this as usize) {
         return p as u64;
     }
+    // a texture the title placed at an address of its memory: on the console that address is
+    // its GPU address (the PC has none for a texture – 0, which GTA VI passed to memset)
+    let placed = super::title_textures::address(this as usize)
+        .or_else(|| super::vram::address(this as usize))
+        .or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied()));
+    if let Some(p) = placed {
+        return p as u64;
+    }
     let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, 11));
     f(this)
 }
