@@ -3361,6 +3361,56 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     }
 }
 
+/// A retail game's streaming pool, with its numbers: 99,776 physical pages (6.09 GiB) taken at
+/// once, a reservation of 64 KiB pages for them made afterwards, and each page mapped into it by
+/// XMemMapPhysicalPagesScatter. Its watchdog allows the start a few seconds: with a tile
+/// mapping per page on the GPU this took longer. Run alone (it takes half the windows);
+/// `XCL_TEST_HOMES_FIRST=1`: the pages are mapped at their home before.
+#[test]
+#[ignore]
+fn gpu_sparse_vram_pool_of_physical_pages_is_mapped_in_seconds() {
+    use crate::hle::kernelx::*;
+    if !gpu_ready() {
+        return;
+    }
+    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    let u = crate::gpu::uma::get().expect("UMA");
+    unsafe {
+        let t0 = std::time::Instant::now();
+        // (`XCL_TEST_POOL_PAGES`: fewer, for a quick run)
+        let mut n = std::env::var("XCL_TEST_POOL_PAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(99_776usize);
+        let mut pages = vec![0u64; n];
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let t_alloc = t0.elapsed();
+        if std::env::var("XCL_TEST_HOMES_FIRST").is_ok() {
+            assert!(!XMemMapPhysicalPages(std::ptr::null_mut(), n, pages.as_mut_ptr()).is_null());
+        }
+        let t_home = t0.elapsed();
+        let pool = VirtualAlloc(std::ptr::null(), 0x1_85c0_0000, 0x2040_2000, 0x2004) as usize;
+        assert!(pool != 0);
+        let at: Vec<*mut std::ffi::c_void> = (0..n).map(|i| (pool + i * PHYS_PAGE_SIZE) as *mut std::ffi::c_void).collect();
+        let t1 = std::time::Instant::now();
+        assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), n, pages.as_mut_ptr()), 1);
+        let t_map = t1.elapsed();
+        *(pool as *mut u32) = 0x600D_0001;
+        *((pool + (n - 1) * PHYS_PAGE_SIZE) as *mut u32) = 0x600D_0002;
+        let mut got = [0u8; 4];
+        assert!(read_physical_pages(&[pages[n - 1] as usize], 0, &mut got) && u32::from_le_bytes(got) == 0x600D_0002);
+        println!(
+            "pool of {n} pages: allocated in {:.2} s, at home {:.2} s, mapped into the reservation at {pool:#x} (sparse window: {}) in {:.2} s",
+            t_alloc.as_secs_f64(),
+            (t_home - t_alloc).as_secs_f64(),
+            u.is_sparse(pool),
+            t_map.as_secs_f64()
+        );
+        let t2 = std::time::Instant::now();
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_mut_ptr()), 1);
+        assert_eq!(VirtualFree(pool as *mut _, 0, 0x8000), 1);
+        println!("freed in {:.2} s", t2.elapsed().as_secs_f64());
+        assert!(t_map.as_secs_f64() < 5.0, "mapping the pool took {:.1} s", t_map.as_secs_f64());
+    }
+}
+
 /// Experiment: does OpenExistingHeapFromAddress accept a reservation with only part committed?
 #[test]
 #[ignore]
