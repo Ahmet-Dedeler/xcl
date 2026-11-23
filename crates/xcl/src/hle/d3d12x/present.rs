@@ -188,6 +188,16 @@ pub fn note_use(res: usize, what: usize) {
     }
 }
 
+/// A resource is gone: the frame trace's counts and the presented list no longer name it (the
+/// busiest target's GetDesc at a frame dump went through a freed object – GTA VI replaces its
+/// UI target when its front end starts).
+pub fn forget(res: usize) {
+    if let Some(m) = USES.lock().unwrap().as_mut() {
+        m.remove(&res);
+    }
+    PRESENTED.lock().unwrap().retain(|&r| r != res);
+}
+
 /// resources the title presented
 static PRESENTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 

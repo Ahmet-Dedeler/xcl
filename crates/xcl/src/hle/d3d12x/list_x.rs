@@ -528,6 +528,8 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
+    /// geometry in ordinary memory this recording names, and its copies (`cpu_geometry`)
+    cpu_copies: Vec<CpuCopy>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
 }
@@ -1623,62 +1625,142 @@ fn pc_va(va: u64) -> u64 {
 /// unhandled exception names these.
 pub static LAST_INDEX_VIEW: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
-/// copies of index data the title keeps in ordinary memory: (address, bytes, hash of the
-/// contents, upload buffer, its GPU address)
-static CPU_INDICES: Mutex<Vec<(u64, u32, u64, ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+/// An upload buffer that geometry in ordinary memory is copied into, filled front to back.
+struct CpuChunk {
+    _buf: ID3D12Resource,
+    gpu: u64,
+    /// where it is mapped (kept mapped)
+    ptr: usize,
+    size: usize,
+    used: usize,
+    /// the present count when a piece was last taken
+    frame: u64,
+}
 
-/// An index buffer view of ordinary process memory (not unified memory, no PC resource): the
-/// console's GPU reads any address of the title, a PC GPU does not – a Windows driver reads
-/// nothing there, D3DMetal looks the address up, finds no buffer and ends the process (GTA VI:
-/// 393216 bytes of 16-bit indices on its heap). The indices are copied to an upload buffer,
-/// one per address, size and contents (a copy a recorded draw uses is never rewritten).
-unsafe fn cpu_index_view(list: *mut c_void, v: &D3D12_INDEX_BUFFER_VIEW) -> Option<D3D12_INDEX_BUFFER_VIEW> {
-    let (va, n) = (v.BufferLocation, v.SizeInBytes);
-    if !crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed) || va == 0 || n == 0 || va >= 1 << 40 || n > 64 << 20 {
+static CPU_CHUNKS: Mutex<Vec<CpuChunk>> = Mutex::new(Vec::new());
+
+/// A piece of a list's geometry in ordinary memory and its copy on the GPU.
+#[derive(Clone, Copy)]
+struct CpuCopy {
+    src: usize,
+    len: usize,
+    dst: usize,
+    gpu: u64,
+}
+
+/// Whether geometry in ordinary memory is copied for the GPU: on a native host (D3DMetal ends
+/// the process on an address it has no buffer for), elsewhere with `XCL_CPU_GEOMETRY=1` (a PC
+/// resource's GPU address can be readable process memory by number there; `=0`: never).
+fn cpu_geometry_enabled() -> bool {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    match *ON.get_or_init(|| std::env::var("XCL_CPU_GEOMETRY").ok().map(|v| v.trim() != "0")) {
+        Some(on) => on,
+        None => crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed),
+    }
+}
+
+/// `n` bytes of an upload buffer: (where it is mapped, its GPU address). Chunks of 8 MiB (or
+/// the size asked for), used again 8 presents after their last piece was taken.
+unsafe fn cpu_chunk_take(list: *mut c_void, n: usize) -> Option<(usize, u64)> {
+    let frame = super::present::presents();
+    let n = n.next_multiple_of(64);
+    let mut chunks = CPU_CHUNKS.lock().unwrap();
+    let at = match chunks.iter().position(|c| c.size - c.used >= n && c.frame + 8 > frame) {
+        Some(k) => k,
+        None => match chunks.iter().position(|c| c.size >= n && c.frame + 8 <= frame) {
+            Some(k) => {
+                chunks[k].used = 0;
+                k
+            }
+            None => {
+                let size = n.max(8 << 20).next_multiple_of(0x1_0000);
+                let dev = device_of(list)?;
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut b: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut b).ok()?;
+                let b = b?;
+                let mut p: *mut c_void = std::ptr::null_mut();
+                b.Map(0, None, Some(&mut p)).ok()?;
+                if p.is_null() {
+                    return None;
+                }
+                let gpu = b.GetGPUVirtualAddress();
+                chunks.push(CpuChunk { _buf: b, gpu, ptr: p as usize, size, used: 0, frame });
+                chunks.len() - 1
+            }
+        },
+    };
+    let c = &mut chunks[at];
+    let off = c.used;
+    c.used += n;
+    c.frame = frame;
+    Some((c.ptr + off, c.gpu + off as u64))
+}
+
+/// Geometry (vertices or indices) a view names in ordinary process memory – not unified memory,
+/// no PC resource: the console's GPU reads any address of the title, a PC GPU does not (a
+/// Windows driver reads nothing there, D3DMetal looks the address up, finds no buffer and ends
+/// the process). GTA VI's UI keeps a 1.2 MB vertex buffer and 393216 bytes of 16-bit indices on
+/// its heap. The bytes are copied to an upload buffer now and again when the list is executed
+/// (`cpu_geometry_before_execute`: a title fills such buffers after recording the draw); views
+/// inside a piece the list already copied share it (the UI sets a view of the buffer's rest
+/// before each draw). Returns the copy's GPU address.
+unsafe fn cpu_geometry(list: *mut c_void, va: u64, n: u32, what: &str) -> Option<u64> {
+    if !cpu_geometry_enabled() || va == 0 || n == 0 || va >= 1 << 40 || n > 64 << 20 {
         return None;
     }
-    if crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, n as usize) {
+    if crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize)) {
         return None;
     }
-    let data = std::slice::from_raw_parts(va as *const u8, n as usize);
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for c in data.chunks(8) {
-        let mut w = [0u8; 8];
-        w[..c.len()].copy_from_slice(c);
-        hash = (hash ^ u64::from_le_bytes(w)).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
+    let (src, len) = (va as usize, n as usize);
+    let known = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).and_then(|s| s.cpu_copies.iter().find(|c| c.src <= src && src + len <= c.src + c.len).copied());
+    if let Some(c) = known {
+        return Some(c.gpu + (src - c.src) as u64);
     }
-    let mut cache = CPU_INDICES.lock().unwrap();
-    if let Some(e) = cache.iter().find(|e| e.0 == va && e.1 == n && e.2 == hash) {
-        return Some(D3D12_INDEX_BUFFER_VIEW { BufferLocation: e.4, ..*v });
+    if !crate::gpu::shader::readable(src, len) {
+        return None;
     }
     static N: AtomicU64 = AtomicU64::new(0);
     if once(&N, 8) {
-        crate::xlog_warn!("D3D12.X: IASetIndexBuffer: {n} bytes at {va:#x} are ordinary memory, not unified memory – the indices are copied to an upload buffer (first bytes {:02x?})", &data[..data.len().min(16)]);
+        let data = std::slice::from_raw_parts(src as *const u8, len.min(16));
+        crate::xlog_warn!("D3D12.X: {what}: {n} bytes at {va:#x} are ordinary memory, not unified memory – copied to an upload buffer, again when the list is executed (first bytes {data:02x?})");
     }
-    // contents that keep changing: the oldest copies go (a list recorded long ago may name one)
-    if cache.len() >= 256 {
-        cache.drain(..64);
+    let (dst, gpu) = cpu_chunk_take(list, len)?;
+    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+    let copy = CpuCopy { src, len, dst, gpu };
+    if let Some(s) = LISTS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(list as usize)) {
+        s.cpu_copies.push(copy);
     }
-    let dev = device_of(list)?;
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: (n as u64).next_multiple_of(0x1_0000),
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
+    Some(gpu)
+}
+
+/// Before lists are executed: the geometry they name in ordinary memory is copied again (what
+/// the title wrote there since it recorded the draws).
+pub(super) unsafe fn cpu_geometry_before_execute(lists: &[*mut c_void]) {
+    let copies: Vec<CpuCopy> = {
+        let g = LISTS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_copies.iter().copied()).collect()
     };
-    let mut b: Option<ID3D12Resource> = None;
-    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut b).ok()?;
-    let b = b?;
-    let mut p: *mut c_void = std::ptr::null_mut();
-    b.Map(0, None, Some(&mut p)).ok()?;
-    std::ptr::copy_nonoverlapping(data.as_ptr(), p as *mut u8, data.len());
-    b.Unmap(0, None);
-    let gpu = b.GetGPUVirtualAddress();
-    cache.push((va, n, hash, b, gpu));
+    for c in copies {
+        if crate::gpu::shader::readable(c.src, c.len) {
+            std::ptr::copy_nonoverlapping(c.src as *const u8, c.dst as *mut u8, c.len);
+        }
+    }
+}
+
+/// An index buffer view of ordinary process memory as one of its copy (`cpu_geometry`).
+unsafe fn cpu_index_view(list: *mut c_void, v: &D3D12_INDEX_BUFFER_VIEW) -> Option<D3D12_INDEX_BUFFER_VIEW> {
+    let gpu = cpu_geometry(list, v.BufferLocation, v.SizeInBytes, "IASetIndexBuffer")?;
     Some(D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu, ..*v })
 }
 
@@ -1753,6 +1835,11 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
             let mut v = views.add(k).read_unaligned();
             let title = v.BufferLocation;
             v.BufferLocation = pc_va(v.BufferLocation);
+            if v.BufferLocation == title {
+                if let Some(gpu) = cpu_geometry(this, title, v.SizeInBytes, "IASetVertexBuffers") {
+                    v.BufferLocation = gpu;
+                }
+            }
             if super::present::trace_frame() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let i = N.fetch_add(1, Ordering::Relaxed);
@@ -1871,6 +1958,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.clear_sparse_writes();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.cpu_copies.clear();
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
