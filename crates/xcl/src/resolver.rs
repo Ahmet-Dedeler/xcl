@@ -433,10 +433,10 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
         let full = String::from_utf16_lossy(&buf[..n as usize]);
         let key = dll_key(&full);
         if let Some(m) = reg.hle_for(&key) {
-            if let ImportName::Name { name, .. } = what {
-                if let Some(&a) = m.exports.get(name.as_str()) {
-                    return Some(a);
-                }
+            // by name, or by an ordinal the module knows (ws2_32's: a lookup by number must not
+            // reach the host's connect while the network is off)
+            if let Some(&a) = hle_name_for(m, &key, what).and_then(|name| m.exports.get(name)) {
+                return Some(a);
             }
         }
     }

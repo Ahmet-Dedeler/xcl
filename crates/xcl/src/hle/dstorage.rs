@@ -940,6 +940,37 @@ struct QueueInner {
 impl QueueInner {
     fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
         FAILED.fetch_add(1, Ordering::Relaxed);
+        // a destination (or source) the request could not use: what that memory is – a title that
+        // streams into address space XCL gave it wrongly fails here and nowhere else
+        if hr == E_ACCESS_VIOLATION {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                let known = unsafe { VirtualQuery(request.destination as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
+                let uma = crate::gpu::uma::get();
+                crate::xlog_warn!(
+                    "DirectStorage: access violation: options {:#x}, destination {:#x}{} ({} bytes, page offset {}): {} – state {:#x}, protect {:#x}, allocated with {:#x}, region {:#x}+{:#x}; unified memory window {:?}, sparse {}, graphics reservation {}",
+                    request.options,
+                    request.destination,
+                    if request.dest_physical_pages() { " (a page array)" } else { "" },
+                    request.destination_size,
+                    request.destination_page_offset,
+                    if known { "memory there" } else { "nothing known there" },
+                    m.State,
+                    m.Protect,
+                    m.AllocationProtect,
+                    m.AllocationBase as usize,
+                    m.RegionSize,
+                    uma.and_then(|u| u.window_of(request.destination as usize)),
+                    uma.is_some_and(|u| u.is_sparse(request.destination as usize)),
+                    crate::hle::kernelx::in_graphics_reservation(request.destination as usize)
+                );
+                if request.dest_physical_pages() && crate::gpu::shader::readable(request.destination as usize, 8) {
+                    let page = unsafe { (request.destination as *const usize).read_unaligned() };
+                    crate::xlog_warn!("DirectStorage: … its first page now: {}", crate::hle::kernelx::describe_physical_page(page));
+                }
+            }
+        }
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
