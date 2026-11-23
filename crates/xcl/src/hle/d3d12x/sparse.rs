@@ -1202,6 +1202,18 @@ pub unsafe fn committed(a: usize, n: usize) {
     }
 }
 
+/// Whether the 4 KiB page at `a` of a sparse window is committed, from what `committed` and
+/// `decommitted` were told (None: no windows on the GPU, nothing was noted). Wine's
+/// VirtualQuery walks the pages to the end of the run with the same state, which in a window
+/// with gigabytes reserved took 0.4 ms a call – 99,776 physical pages mapped in two minutes.
+pub fn page_committed(a: usize) -> Option<bool> {
+    let g = STATE.lock().unwrap();
+    let s = g.as_ref()?;
+    s.window_index(a)?;
+    let t = a & !(TILE - 1);
+    Some(s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((a - t) / PAGE)) == 0))
+}
+
 /// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
 /// full-tile decommit or incrementally via sub-tile decommits) give their video memory back
 /// (unless a placed buffer still pins the pool tile).
