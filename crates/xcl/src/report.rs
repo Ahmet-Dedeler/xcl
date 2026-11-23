@@ -70,6 +70,10 @@ pub struct Report {
     /// XCL slots it called that XCL does not implement
     #[serde(default)]
     pub xgameruntime: crate::hle::xgameruntime::api::ApiStats,
+    /// DirectStorage: BCPack requests refused (no decoder) by mode, and bytes filled under
+    /// `XCL_DSTORAGE_BCPACK_FILL`
+    #[serde(default)]
+    pub dstorage: crate::hle::dstorage::DStorageStats,
     pub notes: Vec<String>,
 }
 
@@ -135,6 +139,7 @@ pub fn build() -> Report {
         d3d12: crate::hle::d3d12x::real::stats(),
         audio: crate::hle::xaudio2::stats(),
         xgameruntime: crate::hle::xgameruntime::api::stats(),
+        dstorage: crate::hle::dstorage::stats(),
         notes: vec![
             "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
             "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),
