@@ -1671,6 +1671,8 @@ static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c_void) {
     if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
+        // (a texture kept in step with title memory: what was written while it was mapped)
+        super::title_textures::note_unmap(this as usize);
         return;
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
