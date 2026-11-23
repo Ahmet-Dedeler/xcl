@@ -38,16 +38,18 @@ extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
 }
 
-/// (device, address its bytes are read from, layout, states) of an upload
+/// (device, the title's address – its bytes are read through `TitleMemory` –, layout, states)
+/// of an upload
 type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
 
 struct Entry {
     device: usize,
     /// the title's address of the texture
     va: usize,
-    /// where its bytes are read and its CPU writes watched: `va`, or – for a texture in a GPU
-    /// view of the title's CPU memory with nothing mapped there – the same offset in the CPU
-    /// view (`kernelx::mirrors`)
+    /// where its CPU writes are watched: `va`, or – for a texture in a GPU view of the title's
+    /// CPU memory with nothing mapped there – the same offset in the CPU view
+    /// (`kernelx::mirrors`). Its bytes are read page by page (`TitleMemory`): the command
+    /// queue's page mappings come before this pairing
     src: usize,
     /// `va` lies in a GPU view: `src` is checked again when that view's mappings change
     in_gpu_view: bool,
@@ -831,11 +833,11 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                     if e.unwatched {
                         // what goes up now is what later looks compare with
-                        e.sent = memory_hash(e.src, e.tex.size() as usize);
+                        e.sent = memory_hash(e.va, e.tex.size() as usize);
                     }
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });
@@ -991,25 +993,30 @@ fn pick(all: &[Seen], frame: u64, new_frame: bool, cursors: &mut [usize; 3]) -> 
 }
 
 /// A hash of `len` bytes at `at` for telling a change: four chains of 64-bit words (each step a
-/// bijection of its chain, so a change within one word always shows). Pages that are not
-/// committed or not readable count by their length only (`read_committed` reads them as zero).
+/// bijection of its chain, so a change within one word always shows). The bytes are the ones an
+/// upload reads (`TitleMemory`): in a GPU view the page the GPU's mapping or the CPU view has
+/// there, else the address itself; what is nowhere (not committed, not readable, a view with no
+/// page) counts by its length only – an upload reads it as zero.
 unsafe fn memory_hash(at: usize, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    memory_hash_in(&mut TitleMemory::new(), at, len)
+}
+
+#[cfg(test)]
+pub(super) unsafe fn memory_hash_for_tests(at: usize, len: usize) -> u64 {
+    memory_hash(at, len)
+}
+
+/// `memory_hash` with the places of memory found so far (`memory`): one look at many textures
+/// asks Windows about a region once.
+unsafe fn memory_hash_in(memory: &mut TitleMemory, at: usize, len: usize) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut l = [K, K.rotate_left(13), K.rotate_left(29), K.rotate_left(47)];
     let mut p = at;
     while p < at + len {
-        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
-            break;
-        }
-        let end = (m.BaseAddress as usize + m.RegionSize).min(at + len);
-        if end <= p {
-            break;
-        }
-        let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0;
-        if readable {
-            let b = std::slice::from_raw_parts(p as *const u8, end - p);
+        let (src, same) = memory.locate(p);
+        let n = same.min(at + len - p);
+        if src != 0 {
+            let b = std::slice::from_raw_parts(src as *const u8, n);
             let mut chunks = b.chunks_exact(32);
             for c in &mut chunks {
                 for (i, lane) in l.iter_mut().enumerate() {
@@ -1021,9 +1028,9 @@ unsafe fn memory_hash(at: usize, len: usize) -> u64 {
                 l[i & 3] = (l[i & 3] ^ x as u64).wrapping_mul(K).rotate_left(29);
             }
         } else {
-            l[0] = (l[0] ^ (end - p) as u64 ^ 0x5555).wrapping_mul(K).rotate_left(29);
+            l[0] = (l[0] ^ n as u64 ^ 0x5555).wrapping_mul(K).rotate_left(29);
         }
-        p = end;
+        p += n;
     }
     let mut h = l[0];
     for x in &l[1..] {
@@ -1058,7 +1065,7 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
                 continue;
             }
             all.push(Seen { key: res, size: e.tex.size() as usize, dynamic: e.dynamic, mapped: e.mapped, now, changed: e.changed, made: e.made });
-            places.push((e.src, e.sent));
+            places.push((e.va, e.sent));
         }
         let picked = pick(&all, frame, new_frame, &mut CURSORS.lock().unwrap());
         (picked.into_iter().map(|i| (all[i].key, places[i].0, all[i].size, places[i].1)).collect(), all.len(), all.iter().map(|e| e.size).sum())
@@ -1112,7 +1119,7 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
                 let d = r.GetDesc();
                 crate::xlog_info!("title texture trace: content of the texture at {:#x} ({}x{} format {}, {} bytes) changed – upload #{k}, frame {frame}", e.va, d.Width, d.Height, d.Format.0, e.tex.size());
             }
-            Some((r, (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+            Some((r, (e.device, e.va, Arc::clone(&e.tex), e.states.clone())))
         })
         .collect()
 }
@@ -1234,7 +1241,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         }
         g.push(res);
     }
-    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.device, e.src, Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.device, e.va, Arc::clone(&e.tex), e.gpu_written)) else { return };
     let d = device as *mut c_void;
     let r = res as *mut c_void;
     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
@@ -1400,33 +1407,20 @@ unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
 }
 
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
-/// has only some of its pages mapped).
+/// has only some of its pages mapped). An address in a GPU view of the title's memory, where
+/// the CPU has nothing, gives what the GPU sees there (`TitleMemory`).
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
-    let Some(limit) = at.checked_add(len) else { return out };
+    if at.checked_add(len).is_none() {
+        return out;
+    }
     // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
     // walking it)
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
         return out;
     }
-    let mut p = at;
-    while p < limit {
-        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.RegionSize == 0 {
-            break;
-        }
-        let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
-        if end <= p {
-            break;
-        }
-        let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
-        if readable {
-            copy_committed_region(p, out.as_mut_ptr().add(p - at), end - p);
-        }
-        p = end;
-    }
+    TitleMemory::new().read(at, out.as_mut_ptr(), len);
     out
 }
 
@@ -1477,10 +1471,165 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
 /// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
 /// as much as the detile of a video frame), else read page run by page run.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
+    // (a GPU view of the title's memory is read page by page where the GPU has it: `TitleMemory`)
+    let view = super::gpu_views::lookup(at & !(TitleMemory::PAGE - 1)).is_some() || crate::hle::kernelx::mirrors::source(at).is_some();
+    if !view && crate::gpu::shader::readable(at, len) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
         std::borrow::Cow::Owned(read_committed(at, len))
+    }
+}
+
+/// Where a 64 KiB page of title memory is read.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Place {
+    /// at its own address, as far as Windows has readable memory there
+    Own,
+    /// the whole page at another address (a GPU view's page where the CPU has it)
+    At(usize),
+    /// a GPU view's page with no memory anywhere: zeros
+    Nowhere,
+}
+
+/// How the pages of GPU views were found (`TitleMemory::place`), as indices of `VIEW_READS`.
+const BY_QUEUE_SAME: usize = 0;
+const BY_QUEUE_OTHER: usize = 1;
+const BY_QUEUE_EMPTY: usize = 2;
+const BY_PAIR: usize = 3;
+const BY_OWN: usize = 4;
+const BY_NONE: usize = 5;
+
+/// page reads of GPU views by how the page was found (a page read again counts again)
+static VIEW_READS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// GPU-view page → how it was last found
+static VIEW_PAGES: Mutex<BTreeMap<usize, u8>> = Mutex::new(BTreeMap::new());
+
+/// How the 64 KiB pages of GPU views that title textures were read from were found so far, as
+/// text: by the command queue's page mappings (`gpu_views`) – at the address the paired CPU
+/// view has for them, at another, or with no memory yet –, by the pairing of the two
+/// reservations alone (`kernelx::mirrors`), at the view's own address, or nowhere. Distinct
+/// pages by how they were last found, and all page reads. None: no such page was read.
+pub fn view_sources() -> Option<String> {
+    let mut pages = [0u64; 6];
+    for &k in VIEW_PAGES.lock().unwrap().values() {
+        pages[k as usize] += 1;
+    }
+    if pages.iter().all(|&n| n == 0) {
+        return None;
+    }
+    let r = |k: usize| VIEW_READS[k].load(Ordering::Relaxed);
+    Some(format!(
+        "queue mappings {} page(s) where the paired CPU view has them, {} elsewhere, {} with no memory; pairing alone {}; mapped at the view itself {}; nothing {} (page reads: {} / {} / {} / {} / {} / {})",
+        pages[0], pages[1], pages[2], pages[3], pages[4], pages[5], r(0), r(1), r(2), r(3), r(4), r(5)
+    ))
+}
+
+/// Bytes of the title's memory for an upload or a comparison. In a GPU view of the title's
+/// memory (addresses the CPU never has anything at: a retail game places its streamed textures
+/// and video planes there) a 64 KiB page is read
+/// 1. where the CPU has the physical page the command queue's page mappings show there
+///    (`gpu_views`: what the title told the GPU, page by page),
+/// 2. else at the address itself if a page is mapped there,
+/// 3. else at the same offset of the CPU view the reservation is paired with
+///    (`kernelx::mirrors`: the two reservations are made together and most pages are mapped
+///    at the same offset in both – not all: GPU-only mappings, pages the CPU has elsewhere).
+/// Any other address is read where it is, as far as it is readable. What was last found is
+/// kept – a row is a fraction of a page, and asking Windows about an address in a reservation
+/// of gigabytes is slow (it measures the whole region).
+struct TitleMemory {
+    /// the 64 KiB page last asked for and its place
+    page: (usize, Place),
+    /// the region Windows last described for an address itself: [start, end), readable
+    direct: (usize, usize, bool),
+    /// the same for the place of a view's page
+    source: (usize, usize, bool),
+}
+
+impl TitleMemory {
+    const PAGE: usize = crate::hle::kernelx::PHYS_PAGE_SIZE;
+
+    fn new() -> TitleMemory {
+        TitleMemory { page: (usize::MAX, Place::Own), direct: (0, 0, false), source: (0, 0, false) }
+    }
+
+    /// The region around `a` (kept in `cache`): its end and whether it can be read.
+    unsafe fn region(cache: &mut (usize, usize, bool), a: usize) -> (usize, bool) {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+        if a < cache.0 || a >= cache.1 {
+            let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            *cache = if VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 {
+                // R / RW / WC / X-R…, no guard
+                (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize, m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0)
+            } else {
+                (a & !0xFFF, (a & !0xFFF) + 0x1000, false)
+            };
+        }
+        (cache.1, cache.2)
+    }
+
+    /// The place of the 64 KiB page at `page` (see the type).
+    unsafe fn place(&mut self, page: usize) -> Place {
+        let mapped = super::gpu_views::lookup(page);
+        let paired = crate::hle::kernelx::mirrors::source(page);
+        if mapped.is_none() && paired.is_none() {
+            return Place::Own;
+        }
+        // (a view's page is whole: 64 KiB the title mapped at once)
+        let whole = |m: &mut TitleMemory, a: usize| {
+            let (end, ok) = Self::region(&mut m.source, a);
+            ok && end >= a + Self::PAGE
+        };
+        let (place, how) = match mapped {
+            Some(Some(at)) if whole(self, at) => (Place::At(at), if paired == Some(at) { BY_QUEUE_SAME } else { BY_QUEUE_OTHER }),
+            Some(_) => (Place::Nowhere, BY_QUEUE_EMPTY),
+            None if Self::region(&mut self.direct, page).1 => (Place::Own, BY_OWN),
+            None => match paired {
+                Some(at) if whole(self, at) => (Place::At(at), BY_PAIR),
+                _ => (Place::Nowhere, BY_NONE),
+            },
+        };
+        VIEW_READS[how].fetch_add(1, Ordering::Relaxed);
+        VIEW_PAGES.lock().unwrap().insert(page, how as u8);
+        place
+    }
+
+    /// Where the byte at `at` is read (0: nowhere) and how many bytes from it are in the same
+    /// place (at least 1).
+    unsafe fn locate(&mut self, at: usize) -> (usize, usize) {
+        let page = at & !(Self::PAGE - 1);
+        if self.page.0 != page {
+            self.page = (page, self.place(page));
+        }
+        match self.page.1 {
+            Place::At(src) => (src + (at - page), page + Self::PAGE - at),
+            Place::Nowhere => (0, page + Self::PAGE - at),
+            Place::Own => {
+                let (end, ok) = Self::region(&mut self.direct, at);
+                (if ok { at } else { 0 }, end.min(page + Self::PAGE).max(at + 1) - at)
+            }
+        }
+    }
+
+    /// `n` bytes at `at` to `dst`; what is nowhere stays as `dst` has it. Returns whether all
+    /// of it was read.
+    unsafe fn read(&mut self, mut at: usize, mut dst: *mut u8, mut n: usize) -> bool {
+        let mut all = true;
+        while n > 0 {
+            let (src, same) = self.locate(at);
+            let chunk = n.min(same);
+            match src {
+                0 => all = false,
+                // (the address's own memory: another thread may decommit it meanwhile, and the
+                // copy that tolerates it leaves such a page zero. Not on a Mac: Wine's server
+                // reads another way there – it suspends the whole process for each call)
+                src if src == at && !crate::util::mac_host() => copy_committed_region(src, dst, chunk),
+                src => std::ptr::copy_nonoverlapping(src as *const u8, dst, chunk),
+            }
+            at += chunk;
+            dst = dst.add(chunk);
+            n -= chunk;
+        }
+        all
     }
 }
 
@@ -1723,6 +1872,64 @@ mod tests {
             VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
             assert_eq!(after, at);
             assert_eq!(before, at, "a page mapped at the address but not used yet is its source too");
+        }
+    }
+
+    /// A page of a GPU view is read where the command queue's page mapping shows it; only
+    /// without one at the same offset of the paired CPU view. (A retail game maps most pages
+    /// at the same offset in both – and some only for the GPU, from where they are in the pool.)
+    #[test]
+    fn a_gpu_view_page_is_read_by_the_queues_mapping_before_the_pairing() {
+        use crate::hle::kernelx::{self, AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE as PAGE};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        const VIEW: usize = 16 << 20;
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let pool = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let cpu = VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let gpu = VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            kernelx::mirrors::reserved(cpu, VIEW, 0x2040_2000, 0x04);
+            kernelx::mirrors::reserved(gpu, VIEW, 0x2040_2000, 0x801);
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 2, 0, 4, pages.as_mut_ptr()) as usize, pool);
+            *((pool + PAGE + 8) as *mut u32) = 0xB0B0_0001; // pool page 1, where it is in the pool
+            // pool page 0 for the CPU at page 2 of its view
+            let mut one = [pages[0]];
+            assert_eq!(MapTitlePhysicalPages((cpu + 2 * PAGE) as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, cpu + 2 * PAGE);
+            *((cpu + 2 * PAGE + 8) as *mut u32) = 0xA0A0_0000;
+            let read = |at: usize| {
+                let mut v = 0u32;
+                let all = TitleMemory::new().read(at, &mut v as *mut u32 as *mut u8, 4);
+                (v, all)
+            };
+            // no mapping by the queue: the pairing
+            assert_eq!(read(gpu + 2 * PAGE + 8), (0xA0A0_0000, true));
+            assert_eq!(read(gpu + 3 * PAGE + 8), (0, false), "nothing in either view");
+            assert_eq!(read_committed(gpu + 2 * PAGE, 16)[8..12], 0xA0A0_0000u32.to_le_bytes());
+            // the queue maps pool page 1 at page 2 of the GPU view and pool page 0 at page 3
+            let ranges = [[1u32, 1, 1], [1, 0, 1]];
+            let batch: [usize; 3] = [gpu + 2 * PAGE, 2, ranges.as_ptr() as usize];
+            super::super::gpu_views::update(1, batch.as_ptr() as *const u8, pool, 2);
+            assert_eq!(read(gpu + 2 * PAGE + 8), (0xB0B0_0001, true), "the queue's mapping, not the CPU view's page");
+            assert_eq!(read(gpu + 3 * PAGE + 8), (0xA0A0_0000, true), "a page the CPU has at another offset");
+            let before = memory_hash(gpu + 2 * PAGE, 2 * PAGE);
+            *((pool + PAGE + 0x100) as *mut u8) = 1;
+            assert_ne!(before, memory_hash(gpu + 2 * PAGE, 2 * PAGE), "a write where the page is shows");
+            // unmapped by the queue: the pairing again
+            let ranges = [[2u32, 0, 2]];
+            let batch: [usize; 3] = [gpu + 2 * PAGE, 1, ranges.as_ptr() as usize];
+            super::super::gpu_views::update(1, batch.as_ptr() as *const u8, pool, 2);
+            assert_eq!(read(gpu + 2 * PAGE + 8), (0xA0A0_0000, true));
+            assert_eq!(read(gpu + 3 * PAGE + 8), (0, false));
+            let mut none = [0usize];
+            MapTitlePhysicalPages((cpu + 2 * PAGE) as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            kernelx::mirrors::released(cpu);
+            for r in [pool, cpu, gpu] {
+                VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+            }
         }
     }
 
