@@ -601,6 +601,27 @@ fn tier2(dev: &ID3D12Device) -> bool {
     unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.ResourceHeapTier.0 >= 2 }
 }
 
+/// Whether title textures are tried as reserved resources on shared pages (GPU-owned targets
+/// first, kept-in-step textures at all): `XCL_VRAM_ARENAS=1` – never, `=0` – always; unset:
+/// everywhere but on a native host (Apple's D3DMetal). That one reports tiled resources tier 2
+/// and aliases placed and reserved *buffers*, but two reserved textures mapped to the same tiles
+/// do not show each other's contents there (measured: 512 of 512 rows differ), and what Metal
+/// cannot make is not an error code: the process ends on an assertion. Arenas (placed resources
+/// in heaps) and committed textures are known to work.
+fn on_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("XCL_VRAM_ARENAS") {
+        Ok(v) => v.trim() == "0",
+        Err(_) => {
+            let native = crate::gpu::shader::NATIVE_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed);
+            if native {
+                crate::xlog_info!("D3D12.X: GPU-owned textures in title memory: arenas on this host (XCL_VRAM_ARENAS=0 tries tiled resources on pages)");
+            }
+            !native
+        }
+    })
+}
+
 /// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
 /// the console) backed by shared 64 KiB video-memory pages; None when reserved placement is not
 /// available (the caller falls back to a committed resource).
@@ -616,7 +637,9 @@ pub unsafe fn place_pages(
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
+    // (not on a native host unless asked, `on_pages`: there two reserved textures on the same
+    // pages do not show each other's contents – the caller's committed texture is used)
+    if !tier2(dev) || !on_pages() {
         return None;
     }
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
@@ -631,7 +654,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     if !tier2(dev) {
         return None;
     }
-    if std::env::var_os("XCL_VRAM_ARENAS").is_none() {
+    if on_pages() {
         if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, riid, ppv) {
             return Some(hr);
         }
