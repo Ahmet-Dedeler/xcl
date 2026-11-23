@@ -1775,6 +1775,25 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   4 GiB window – a redesign of how shaders reach title memory.
 - XDefiant, Fortnite, Unicorn Overlord and Minecraft were **not** run after these changes (only the test suites).
 
+## Pipeline creation under Wine (2026-11-23, from a 590 s log of the retail game on a Mac; not run after the change)
+- **Heap lock:** thread dumps at 120 / 180 / 240 / 330 s (`XCL_DUMP_THREADS_AT`): 13 - 16 of the 17 `xcl-dxc` threads and
+  5 - 11 of the title's pipeline threads stood in `RtlEnterCriticalSection` under `Rtl{Allocate,Free,ReAllocate}Heap`
+  (DXC through `CoTaskMemAlloc`, XCL's translation through Rust's allocator: one process heap, one lock), 0 - 2 compiles
+  ran, 328 compute pipelines were built in 550 s. A translation in the title's call took 9 - 14 ms per 1 000 RDNA2
+  instructions before the compiles started and 59 - 197 ms while they ran. Each compiler now has its own heap
+  (`DxcCreateInstance2` + `dxc::HeapMalloc`; on Wine by default, `XCL_DXC_HEAP=1` / `0`). XCL's own allocations are
+  still on the process heap: if title threads still wait there, the next step is a `#[global_allocator]`.
+- **A shader still compiling** was translated again by each pipeline using it (cached-only attempt + worker): the
+  DXIL key and static samplers of a translation are kept for the run (`pso::Translated`); a worker with the key waits
+  for a running compile (`dxc::cached_by_key_in`). Log: `[SHADER] translation of a console shader seen before skipped (#n)`.
+- **Per pipeline:** shaders hashed before the capture lock and copied only when new; pipelines build from the cached
+  DXIL (`console_to_dxil_shared`, an `Arc`); a derived pipeline keeps its base's stage hashes. The `graphics PSO … (#n)`
+  line gives the time for the shaders and the time in the driver per 1 000 pipelines – in the log, 50 000 graphics
+  pipelines took ~1.8 ms of thread time each with every shader cached, and which part is the driver's was not known.
+- Open: a derived pipeline is a new host pipeline (no cache by description); `ShaderCache` holds 128 shaders (the
+  game has ~1 850 VS / PS: older ones come from `translated` on disk per pipeline); every queued background pipeline
+  owns copies of its shader blobs (`OwnedDesc`).
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`
