@@ -38,11 +38,15 @@ use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, S_FALSE, S_OK};
 const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
 const MAX_SCAN: usize = 512;
-/// Words in front of an extended vtable: the original table's address, then the two words the
-/// host's own table has in front of it (offset-to-top and type information in the Itanium C++
-/// ABI, the RTTI locator in MSVC's). A host that runs `dynamic_cast` on an object it is handed
-/// (Apple's D3DMetal) reads them through the object's table pointer.
-const HDR: usize = 3;
+/// Words of the host's own table mirrored in front of an extended vtable. A C++ object's
+/// table pointer is also the way to the words in front of the table: type information and
+/// offset-to-top (Itanium ABI) or the RTTI locator (MSVC), and before those the virtual-base
+/// and virtual-call offsets of a class with virtual inheritance. A host that runs
+/// `dynamic_cast` on an object it is handed, or adjusts `this` through those offsets (Apple's
+/// D3DMetal does both), reads them through the object's table pointer.
+const PREFIX: usize = 16;
+/// Words in front of an extended vtable: the original table's address, then the mirror.
+const HDR: usize = PREFIX + 1;
 /// words of a native host's method table kept after the public methods (see `class_for`)
 const NATIVE_HOST_TAIL: usize = 512;
 
@@ -587,40 +591,39 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         .max()
         .unwrap_or(0);
     let total = (scanned + EXTRA_SLOTS).max(max_console);
+    // A native host (D3DMetal): the scan above cannot tell where its table ends (its code is
+    // in no PE module, and it stops at the first word that is), while the host calls virtual
+    // methods of its own well past it. Every slot up to `total` is taken as the host's and gets
+    // the guard: the host's own calls reach the host's word, a title's XCL's stub or method.
+    let scanned = if m0 == 0 { total } else { scanned };
     let mut v: Vec<usize> = Vec::with_capacity(total + HDR);
     v.push(orig);
-    v.push(*ot.sub(2));
-    v.push(*ot.sub(1));
+    for k in (1..=PREFIX).rev() {
+        v.push(*ot.sub(k));
+    }
     for i in 0..scanned {
         v.push(*ot.add(i));
     }
     let hook = if kind == Kind::CommandQueue { super::present::on_queue_console_method as usize } else { 0 };
-    // A host D3D12 whose code is in no PE module (Apple's D3DMetal under Wine): its classes have
-    // many more virtual methods than the PC interface and the host calls them through this
-    // table, so the words after the public methods stay as the host has them, unguarded, and
-    // its own words follow XCL's slots. Command lists keep XCL's stubs in their slots: titles
-    // call console-only list methods there.
+    // A host D3D12 whose code is in no PE module (Apple's D3DMetal under Wine): its memory is
+    // not known to VirtualQuery (`gpu::shader::readable` probes it), and its classes have more
+    // virtual methods than XCL scans – its own words follow XCL's slots below, so a call of its
+    // own never runs off the end. The slots themselves are as on any host: the guard sends the
+    // host's own calls to the host's method and a title's to XCL's stub.
     let native_host = m0 == 0;
     if native_host {
         static ONCE: AtomicBool = AtomicBool::new(false);
         if !ONCE.swap(true, Ordering::Relaxed) {
             crate::gpu::shader::NATIVE_HOST_MEMORY.store(true, Ordering::Relaxed);
-            crate::xlog_warn!("D3D12.X: the host's D3D12 is not a PE module – words after the public methods are left unguarded, its memory is probed by reading");
+            crate::xlog_warn!("D3D12.X: the host's D3D12 is not a PE module – its memory is probed by reading");
         }
     }
     for i in public..scanned {
-        if native_host {
-            break;
-        }
         let info = stubs::new_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
         v[HDR + i] = super::guard::make_guard(v[HDR + i], info);
     }
     for i in scanned..total {
-        if native_host && kind != Kind::CommandList {
-            v.push(*ot.add(i));
-            continue;
-        }
         let (addr, info) = stubs::make_stub_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
         v.push(addr);
@@ -686,6 +689,14 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         for i in 0..public {
             let name = format!("{}::{} (#{i})", iface.name, iface.methods.get(i).copied().unwrap_or("?"));
             v[HDR + i] = super::guard::make_tracer(v[HDR + i], name);
+        }
+        // `XCL_D3D12_TRACE=all`: the console-only slots after the public methods too (a title
+        // renders through them)
+        if std::env::var("XCL_D3D12_TRACE").is_ok_and(|t| t == "all") {
+            for i in public..total {
+                let name = format!("{}::#{i} (console slot)", iface.name);
+                v[HDR + i] = super::guard::make_tracer(v[HDR + i], name);
+            }
         }
     }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
@@ -4605,7 +4616,8 @@ mod queue_tests {
         let mut pc = [0usize; 32];
         pc[14] = signal as usize;
         pc[18] = get_desc as usize;
-        let ext = [pc.as_ptr() as usize, 0, 0, 0];
+        let mut ext = [0usize; HDR + 1];
+        ext[0] = pc.as_ptr() as usize;
         let vtbl = ext.as_ptr() as usize + 8 * HDR;
         let mut obj = [vtbl];
         let this = obj.as_mut_ptr() as *mut c_void;

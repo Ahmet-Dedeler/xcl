@@ -158,7 +158,9 @@ unsafe extern "system" fn first_chance_logger(info: *mut EXCEPTION_POINTERS) -> 
     let ctx = &*(*info).ContextRecord;
     let code = rec.ExceptionCode as u32;
     // thread names, debug output, XCL's own write-watch arming, single steps
-    if matches!(code, 0x406D_1388 | 0x4001_0006 | 0x4001_000A | 0xE0C1_A7E1 | 0x8000_0004) {
+    // … and illegal instructions: the ones XCL emulates would use up the budget, the others
+    // end in the unhandled-exception report
+    if matches!(code, 0x406D_1388 | 0x4001_0006 | 0x4001_000A | 0xE0C1_A7E1 | 0x8000_0004 | 0xC000_001D) {
         return 0;
     }
     let n = N.fetch_add(1, Ordering::Relaxed);
