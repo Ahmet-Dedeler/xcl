@@ -172,6 +172,16 @@ pub fn wait_for_memory() -> MemorySlot {
         if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             return MemorySlot;
         }
+        // the first times a compile is held back: what the host reports (Wine's figures for
+        // commit are its own)
+        static HELD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = HELD.fetch_add(1, Ordering::Relaxed);
+        if n < 4 || n % 2000 == 0 {
+            crate::xlog_warn!(
+                "DXC memory gate: compile held back (#{n}): {} MB commit available of {} MB, {} MB physical available, {} compile(s) running, {} MB wanted",
+                m.ullAvailPageFile >> 20, m.ullTotalPageFile >> 20, m.ullAvailPhys >> 20, WORKING.load(Ordering::Acquire), need >> 20
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
