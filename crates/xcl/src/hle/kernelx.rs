@@ -843,6 +843,10 @@ struct Away {
     /// homes in a sparse window whose pages went away in this call, given back at its end in
     /// runs (`give_back_homes`): one page at a time, a retail game's start took 20 s
     gone: Vec<usize>,
+    /// addresses in a sparse window that got a page in this call, told to `d3d12x::sparse` at
+    /// its end in runs (`tell_arrived`): a tile mapping per page on the GPU made a retail game's
+    /// 99,776 pages take minutes
+    arrived: Vec<usize>,
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 
@@ -993,6 +997,24 @@ unsafe fn give_back_homes(away: &mut Away) {
     }
 }
 
+/// The addresses in a sparse window that got pages get video memory, in runs of neighbours.
+unsafe fn tell_arrived(away: &mut Away) {
+    let mut at = std::mem::take(&mut away.arrived);
+    at.sort_unstable();
+    at.dedup();
+    let mut i = 0;
+    while i < at.len() {
+        let start = at[i];
+        let mut end = start + PHYS_PAGE;
+        i += 1;
+        while i < at.len() && at[i] == end {
+            end += PHYS_PAGE;
+            i += 1;
+        }
+        crate::hle::d3d12x::sparse::committed(start, end - start);
+    }
+}
+
 /// The page's home, committed again if `move_home_away` gave it back (None: it could not be).
 unsafe fn home_again(home: usize) -> Option<usize> {
     if lazy_home(home) && !committed_page(home) {
@@ -1058,6 +1080,11 @@ struct StateRun {
 
 /// `committed_page`, remembering in `run` the state of the pages around `a`.
 fn committed_page_in(a: usize, run: &mut StateRun) -> bool {
+    // (a page of a sparse window: from what the window was told – on a host without a working
+    // set to ask, Wine on macOS, every other answer here is a VirtualQuery)
+    if let Some(c) = crate::hle::d3d12x::sparse::page_committed(a) {
+        return c;
+    }
     if (run.start..run.end).contains(&a) {
         return run.committed;
     }
@@ -1109,6 +1136,9 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
         }
         // (an address among the homes the caller maps back is one of them: it stays)
         if !committed.contains(&at) {
+            // (one that arrived in this call is not told as arrived any more: the window is told
+            // of the decommit, `tell_arrived` must not commit it again after)
+            away.arrived.retain(|&a| a != at);
             release_at(at);
         }
         true
@@ -1150,6 +1180,7 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
         crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
     }
+    away.arrived.retain(|&a| a != old);
     release_at(old);
     away.at.insert(at, page);
     away.page.insert(page, at);
@@ -1236,6 +1267,7 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
     let away = g.get_or_insert_with(Away::default);
     let r = map_pages(away, va, n, arr);
     give_back_homes(away);
+    tell_arrived(away);
     r
 }
 
@@ -1333,7 +1365,11 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-            crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+            away.arrived.push(at);
+            // (in runs of 256 MB, so a page unmapped again in the same call is found quickly)
+            if away.arrived.len() >= 4096 {
+                tell_arrived(away);
+            }
         }
         away.at.insert(at, p);
         away.page.insert(p, at);

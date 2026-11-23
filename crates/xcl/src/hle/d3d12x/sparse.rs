@@ -185,7 +185,10 @@ fn decommit_tiles(
             }
         }
     }
-    if !unmapped.is_empty() {
+    // (a long list is pruned where it is used, `live_zero_runs`: a title that maps a pool of
+    // 99,776 pages page by page left ten thousands of partly empty tiles, and a scan of them for
+    // every tile that became empty kept its loading thread here for minutes)
+    if !unmapped.is_empty() && to_zero.len() <= 256 {
         to_zero.retain(|&(za, _)| mapped.contains_key(&(za & !(TILE - 1))));
     }
     unmapped
@@ -1298,7 +1301,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if s.window_index(va).is_none() {
         return;
     }
-    let zeroed = std::mem::take(&mut s.to_zero);
+    let zeroed = s.live_zero_runs();
     if !zeroed.is_empty() {
         for &(a, n) in &zeroed {
             s.clear_sent_range(a, n);
@@ -1346,6 +1349,18 @@ pub unsafe fn committed(a: usize, n: usize) {
     s.commit_range(a, n);
 }
 
+/// Whether the 4 KiB page at `a` of a sparse window is committed, from what `committed` and
+/// `decommitted` were told (None: no windows on the GPU, nothing was noted). Wine's
+/// VirtualQuery walks the pages to the end of the run with the same state, which in a window
+/// with gigabytes reserved took 0.4 ms a call – 99,776 physical pages mapped in two minutes.
+pub fn page_committed(a: usize) -> Option<bool> {
+    let g = STATE.lock().unwrap();
+    let s = g.as_ref()?;
+    s.window_index(a)?;
+    let t = a & !(TILE - 1);
+    Some(s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((a - t) / PAGE)) == 0))
+}
+
 /// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
 /// full-tile decommit or incrementally via sub-tile decommits) give their video memory back
 /// (unless a placed buffer still pins the pool tile).
@@ -1363,6 +1378,13 @@ pub unsafe fn decommitted(a: usize, n: usize) {
 }
 
 impl State {
+    /// The ranges to clear, without those of tiles that lost their video memory since.
+    fn live_zero_runs(&mut self) -> Vec<(usize, usize)> {
+        let mut runs = std::mem::take(&mut self.to_zero);
+        runs.retain(|&(za, _)| self.mapped.contains_key(&(za & !(TILE - 1))));
+        runs
+    }
+
     /// `committed` with the state locked
     unsafe fn commit_range(&mut self, a: usize, n: usize) {
         self.ensure_mapped(a, n, |_| 0xFFFF);
@@ -1491,7 +1513,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    let zero_runs = std::mem::take(&mut s.to_zero);
+    let zero_runs = s.live_zero_runs();
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
     }
