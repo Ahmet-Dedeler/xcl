@@ -4518,6 +4518,14 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        // the newer layout's #31: UpdatePageMappings(batch count, batches, page pool address, a
+        // count, 0) – which pool pages the GPU sees at the addresses a title places its pool's
+        // resources at (`gpu_views`; as a stub every texture there read as zeros: a retail
+        // game's streamed textures and the planes of its videos)
+        29 if shifted => {
+            super::gpu_views::update(a1 as u32, a2 as *const u8, a3, a4 as u32);
+            0
+        }
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -4655,28 +4663,6 @@ unsafe fn q_execute_command_lists_x(this: *mut c_void, n: u32, lists: *const *mu
     if !kept.is_empty() {
         q_execute_command_lists(this, kept.len() as u32, kept.as_ptr());
     }
-}
-
-/// command queue #31 of the newer layout (batch count, batches, page pool address, u32, 0): a
-/// retail game calls it on its page pool's copy queue right after
-/// XMemMapPhysicalPagesScatter, with what it just mapped – batches { address, range count,
-/// ranges } of ranges { 1 = mapped / 2 = unmapped, pool page, page count } (64 KiB pages):
-/// the GPU's page tables follow the CPU's. XCL has no GPU page table of its own for pool
-/// pages (RegisterPagePoolX only notes the pool), so there is nothing to update; the result
-/// is not checked. (This is where streamed texture pages change hands.)
-unsafe fn q_update_page_mappings_x(n: u32, batches: *const u8, pool: u64, arg: u32) {
-    static CALLS: AtomicU64 = AtomicU64::new(0);
-    if CALLS.fetch_add(1, Ordering::Relaxed) != 0 {
-        return;
-    }
-    let first = if n != 0 && crate::gpu::shader::readable(batches as usize, 0x18) {
-        let (va, ranges, p) = ((batches as *const u64).read_unaligned(), (batches.add(8) as *const u32).read_unaligned(), (batches.add(0x10) as *const usize).read_unaligned());
-        let range = if ranges != 0 && crate::gpu::shader::readable(p, 12) { (p as *const [u32; 3]).read_unaligned() } else { [0; 3] };
-        format!("first batch: address {va:#x}, {ranges} range(s), first {{ flags {}, pool page {:#x}, {} page(s) }}", range[0], range[1], range[2])
-    } else {
-        String::from("no readable batch")
-    };
-    crate::xlog_info!("D3D12.X: command queue #31 (page mappings of pool {pool:#x}: {n} batch(es), {arg:#x}) – XCL keeps no GPU page table for pool pages; not done ({first})");
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code

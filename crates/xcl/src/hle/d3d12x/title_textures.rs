@@ -501,9 +501,12 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
 }
 
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
-/// has only some of its pages mapped).
+/// has only some of its pages mapped). An address the title only mapped for the GPU (a page
+/// pool's GPU view, `gpu_views`: nothing is there for the CPU) gives what the page mapped
+/// there holds where the CPU has it.
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let readable = |m: &MEMORY_BASIC_INFORMATION| m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
     let mut out = vec![0u8; len];
     let mut p = at;
     while p < at + len {
@@ -512,13 +515,35 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
             break;
         }
         let end = (m.BaseAddress as usize + m.RegionSize).min(at + len);
-        let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
-        if readable {
+        if readable(&m) {
             std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr().add(p - at), end - p);
+        } else if super::gpu_views::any() {
+            // a 64 KiB page at a time: each has its own place
+            const PAGE: usize = crate::hle::kernelx::PHYS_PAGE_SIZE;
+            let mut q = p;
+            while q < end {
+                let n = ((q & !(PAGE - 1)) + PAGE).min(end) - q;
+                if let Some(src) = super::gpu_views::memory_at(q) {
+                    let mut s: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                    if VirtualQuery(src as *const c_void, &mut s, std::mem::size_of_val(&s)) != 0 && readable(&s) && s.BaseAddress as usize + s.RegionSize >= src + n {
+                        std::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr().add(q - at), n);
+                        VIEW_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
+                q += n;
+            }
         }
         p = end;
     }
     out
+}
+
+/// bytes of textures read through a page pool's GPU view so far (`read_committed`)
+static VIEW_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of title textures read through a page pool's GPU view so far.
+pub fn view_bytes() -> u64 {
+    VIEW_BYTES.load(Ordering::Relaxed)
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
