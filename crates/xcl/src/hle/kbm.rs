@@ -260,7 +260,15 @@ pub fn attach(hwnd: *mut c_void) {
     );
 }
 
+/// `XCL_BACKGROUND=1`: the window opens without taking the focus and never holds the cursor
+/// (a run someone only looks at now and then, while working in other programs).
+pub fn background() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_BACKGROUND").is_ok_and(|v| v.trim() == "1"))
+}
+
 unsafe fn hold_cursor(hwnd: *mut c_void, on: bool) {
+    let on = on && !background();
     if !on {
         if CAPTURED.swap(false, Ordering::AcqRel) {
             ClipCursor(std::ptr::null());
