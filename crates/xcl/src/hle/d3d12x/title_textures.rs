@@ -921,6 +921,11 @@ const HOT_BYTES: usize = 64 << 20;
 /// after it was made shows sooner), and the rest.
 const TURN_BYTES: usize = 2 << 20;
 const YOUNG_FRAMES: u64 = 300;
+/// A texture in a GPU view of the title's memory (a page pool's: streamed textures) whose
+/// content changed is looked at once a frame for this many presented frames after its last
+/// change, then in turn again: what fills these is streaming (a few writes, then none), and a
+/// front end has hundreds of MiB of them.
+const POOL_FRAMES: u64 = 60;
 
 /// What `pick` needs of a texture in memory that is not write-watched.
 #[derive(Clone, Copy)]
@@ -934,12 +939,15 @@ struct Seen {
     now: bool,
     changed: u64,
     made: u64,
+    /// placed in a GPU view of the title's memory (streamed textures: `POOL_FRAMES`)
+    pool: bool,
 }
 
 /// The textures of `all` (ascending keys) to compare before this submit, as indices: those
-/// just unmapped or whose content changed in the last `HOT_FRAMES` frames; at a frame's first submit
-/// (`new_frame`) those that ever changed; and of each turn (`cursors`: the key each stopped at)
-/// the next `TURN_BYTES`, at least one texture.
+/// just unmapped or whose content changed in the last `HOT_FRAMES` frames (a GPU view's: in
+/// this frame only – once a frame is what streaming needs); at a frame's first submit (`new_frame`) those
+/// that ever changed (a GPU view's: in the last `POOL_FRAMES` frames, `poll_unwatched`); and
+/// of each turn (`cursors`: the key each stopped at) the next `TURN_BYTES`, at least one texture.
 fn pick(all: &[Seen], frame: u64, new_frame: bool, cursors: &mut [usize; 3]) -> Vec<usize> {
     let mut look = Vec::new();
     let mut hot_bytes = 0usize;
@@ -953,7 +961,9 @@ fn pick(all: &[Seen], frame: u64, new_frame: bool, cursors: &mut [usize; 3]) -> 
         } else {
             0
         };
-        let hot = e.dynamic && frame.saturating_sub(e.changed) < HOT_FRAMES;
+        // (a GPU view's: for the rest of the frame it changed in – what is written in two steps
+        // within a frame is complete at its last submit –, then once a frame)
+        let hot = e.dynamic && if e.pool { e.changed == frame } else { frame.saturating_sub(e.changed) < HOT_FRAMES };
         if e.now || hot || (e.dynamic && new_frame) {
             if e.now || hot_bytes + e.size <= HOT_BYTES {
                 hot_bytes += e.size;
@@ -1028,6 +1038,26 @@ unsafe fn memory_hash_in(memory: &mut TitleMemory, at: usize, len: usize) -> u64
     h ^ h >> 31
 }
 
+/// looks of `poll_unwatched` that compared something, the bytes they hashed, the time that took
+/// and the uploads that followed a change
+static LOOKS: AtomicU64 = AtomicU64::new(0);
+static HASHED: AtomicU64 = AtomicU64::new(0);
+static NANOS: AtomicU64 = AtomicU64::new(0);
+static CHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// What keeping title textures in step cost since this was last asked (the frame rate's log
+/// line asks every 300 frames), as text: the content comparison (looks, MiB hashed, ms, uploads
+/// after a change) and all uploads (MiB, ms).
+pub fn cost_since_last() -> String {
+    static LAST: Mutex<[u64; 6]> = Mutex::new([0; 6]);
+    let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let now = [l(&LOOKS), l(&HASHED), l(&NANOS), l(&CHANGED), l(&UPLOAD_BYTES), l(&UPLOAD_NANOS)];
+    let mut last = LAST.lock().unwrap();
+    let d: Vec<u64> = now.iter().zip(last.iter()).map(|(n, o)| n.saturating_sub(*o)).collect();
+    *last = now;
+    format!("{} looks compared {} MiB in {} ms ({} changed); uploads {} MiB in {} ms", d[0], d[1] >> 20, d[2] / 1_000_000, d[3], d[4] >> 20, d[5] / 1_000_000)
+}
+
 /// Textures in memory that is not write-watched whose content differs from what was last
 /// uploaded. Those that changed in the last `HOT_FRAMES` frames are compared before every
 /// submit (what a list of this submit samples is complete by now – on the console the GPU reads
@@ -1037,10 +1067,6 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
     static LAST_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static UNWATCHED: AtomicU64 = AtomicU64::new(0);
     static CURSORS: Mutex<[usize; 3]> = Mutex::new([0; 3]);
-    static LOOKS: AtomicU64 = AtomicU64::new(0);
-    static HASHED: AtomicU64 = AtomicU64::new(0);
-    static NANOS: AtomicU64 = AtomicU64::new(0);
-    static CHANGED: AtomicU64 = AtomicU64::new(0);
     let frame = frame_now();
     let new_frame = LAST_FRAME.swap(frame, Ordering::Relaxed) != frame;
     // (texture, address, bytes, hash last sent)
@@ -1053,7 +1079,13 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
             if !e.unwatched || e.pending || e.gpu_written {
                 continue;
             }
-            all.push(Seen { key: res, size: e.tex.size() as usize, dynamic: e.dynamic, mapped: e.mapped, now, changed: e.changed, made: e.made });
+            let size = e.tex.size() as usize;
+            let pool = e.in_gpu_view || super::gpu_views::in_range(e.va, size);
+            if pool && e.dynamic && frame.saturating_sub(e.changed) >= POOL_FRAMES {
+                // streamed in and quiet since: back to its turn
+                e.dynamic = false;
+            }
+            all.push(Seen { key: res, size, dynamic: e.dynamic, mapped: e.mapped, now, changed: e.changed, made: e.made, pool });
             places.push((e.va, e.sent));
         }
         let picked = pick(&all, frame, new_frame, &mut CURSORS.lock().unwrap());
@@ -1066,8 +1098,9 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
     let t0 = std::time::Instant::now();
     let mut changed: Vec<(usize, u64)> = Vec::new();
     let mut hashed = 0usize;
+    let mut memory = TitleMemory::new();
     for &(res, va, size, sent) in &look {
-        let h = memory_hash(va, size);
+        let h = memory_hash_in(&mut memory, va, size);
         hashed += size;
         if h != sent {
             changed.push((res, h));
@@ -1885,7 +1918,7 @@ mod tests {
     }
 
     fn seen(key: usize, size: usize) -> Seen {
-        Seen { key, size, dynamic: false, mapped: false, now: false, changed: 0, made: 0 }
+        Seen { key, size, dynamic: false, mapped: false, now: false, changed: 0, made: 0, pool: false }
     }
 
     /// Textures that never changed are all looked at within about (their bytes / `TURN_BYTES`)
@@ -1951,6 +1984,30 @@ mod tests {
         // one just unmapped: before this submit, whatever else waits, and once
         all[77].now = true;
         assert_eq!(pick(&all, later, false, &mut cursors).iter().filter(|&&i| i == 77).count(), 1);
+    }
+
+    /// A GPU view's texture that changed (streamed in) is looked at once a frame, not before
+    /// every submit; one that never changed has its turn like any other.
+    #[test]
+    fn a_gpu_views_changed_texture_is_looked_at_once_a_frame() {
+        let mut all: Vec<Seen> = (0..500).map(|k| seen(0x1000 + k, 2 << 20)).collect();
+        for e in all.iter_mut() {
+            e.pool = true;
+        }
+        all[300].dynamic = true;
+        all[300].changed = 999;
+        let mut cursors = [0usize; 3];
+        assert!(pick(&all, 1000, true, &mut cursors).contains(&300));
+        assert!(!pick(&all, 1000, false, &mut cursors).contains(&300));
+        assert!(!pick(&all, 1000, false, &mut cursors).contains(&300));
+        assert!(pick(&all, 1001, true, &mut cursors).contains(&300));
+        // changed in this frame: before its later submits too
+        all[300].changed = 1001;
+        assert!(pick(&all, 1001, false, &mut cursors).contains(&300));
+        all[300].changed = 999;
+        // the others: one turn's bytes a submit
+        let n = pick(&all, 1001, false, &mut cursors).len();
+        assert_eq!(n, 1);
     }
 
     /// More changed textures than `HOT_BYTES`: the rest are looked at in their turn.
