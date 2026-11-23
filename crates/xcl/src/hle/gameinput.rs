@@ -321,7 +321,15 @@ unsafe fn keyboard() -> u32 {
         return 0;
     }
     const KEYS: [(i32, u32); 10] = [(0x0D, A), (0x20, A), (0x1B, B), (0x08, B), (0x26, DPAD_UP), (0x28, DPAD_DOWN), (0x25, DPAD_LEFT), (0x27, DPAD_RIGHT), (0x09, VIEW), (0x50, MENU)];
-    KEYS.iter().filter(|(k, _)| GetAsyncKeyState(*k) as u16 & 0x8000 != 0).fold(0, |b, (_, g)| b | g)
+    let down = KEYS.iter().filter(|(k, _)| GetAsyncKeyState(*k) as u16 & 0x8000 != 0).fold(0, |b, (_, g)| b | g);
+    if down != 0 && !super::kbm::input_is_ours() {
+        // background mode: keys typed while the window has not been clicked are someone's
+        // work in another program
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_info!("GameInput: keys are down ({down:#x}) but the window has not been clicked – ignored (XCL_BACKGROUND)"));
+        return 0;
+    }
+    down
 }
 
 /// Merge host keyboard/mouse input (only when `keyboard_mouse` is enabled) and scripted
