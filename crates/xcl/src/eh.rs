@@ -141,7 +141,131 @@ pub fn install_crash_handler() {
         SetUnhandledExceptionFilter(Some(unhandled_filter));
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(null_call_logger));
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(unsupported_insn_handler));
+        if std::env::var_os("XCL_TRACE_EXCEPTIONS").is_some() {
+            windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(first_chance_logger));
+        }
     }
+}
+
+/// `XCL_TRACE_EXCEPTIONS=1`: the first 24 exceptions raised anywhere, as they are raised (code,
+/// address, thread, parameters, the return addresses on the stack) – for a thread that ends
+/// in nested exceptions, where the unhandled-exception report never comes.
+unsafe extern "system" fn first_chance_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let rec = &*(*info).ExceptionRecord;
+    let ctx = &*(*info).ContextRecord;
+    let code = rec.ExceptionCode as u32;
+    // thread names, debug output, XCL's own write-watch arming, single steps
+    if matches!(code, 0x406D_1388 | 0x4001_0006 | 0x4001_000A | 0xE0C1_A7E1 | 0x8000_0004) {
+        return 0;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 24 {
+        let params: Vec<String> = (0..(rec.NumberParameters as usize).min(4)).map(|k| format!("{:#x}", rec.ExceptionInformation[k])).collect();
+        crate::xlog_warn!(
+            "exception #{n} {code:#010x} at {} on thread {}, parameters [{}], rsp {:#x}; on the stack: {}",
+            modules::describe_address(rec.ExceptionAddress as usize),
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            params.join(", "),
+            ctx.Rsp,
+            stack_callers(ctx.Rsp as usize)
+        );
+        crate::log::flush();
+    }
+    0
+}
+
+/// Length of the ModRM operand bytes (ModRM, SIB, displacement) of a memory operand.
+unsafe fn modrm_len(p: *const u8) -> Option<usize> {
+    let m = *p;
+    let (md, rm) = (m >> 6, m & 7);
+    if md == 3 {
+        return None;
+    }
+    let mut n = 1;
+    if rm == 4 {
+        n += 1;
+        if md == 0 && *p.add(1) & 7 == 5 {
+            n += 4;
+        }
+    } else if md == 0 && rm == 5 {
+        n += 4;
+    }
+    n += match md {
+        1 => 1,
+        2 => 4,
+        _ => 0,
+    };
+    Some(n)
+}
+
+/// Zen 2 instructions a host CPU or translator does not run (Rosetta 2: CLWB, CLZERO), raised
+/// as illegal instructions. CLWB only hints the cache: the site is patched to NOPs, so it
+/// traps once. CLZERO zeroes the 64-byte line at RAX: done here on every trap.
+unsafe extern "system" fn unsupported_insn_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    static SITES: AtomicUsize = AtomicUsize::new(0);
+    let rec = &*(*info).ExceptionRecord;
+    let ctx = &mut *(*info).ContextRecord;
+    if rec.ExceptionCode as u32 != 0xC000_001D {
+        return 0;
+    }
+    let ip = ctx.Rip as *const u8;
+    // CLZERO: 0F 01 FC
+    if *ip == 0x0F && *ip.add(1) == 0x01 && *ip.add(2) == 0xFC {
+        std::ptr::write_bytes((ctx.Rax as usize & !63) as *mut u8, 0, 64);
+        ctx.Rip += 3;
+        if SITES.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::xlog_warn!("CPU: CLZERO is not available on this host – emulated at each use (first at {})", modules::describe_address(ip as usize));
+        }
+        return -1;
+    }
+    // CLWB m8: 66 [REX] 0F AE /6
+    let mut k = 0;
+    if *ip != 0x66 {
+        return 0;
+    }
+    k += 1;
+    if *ip.add(k) & 0xF0 == 0x40 {
+        k += 1;
+    }
+    if *ip.add(k) != 0x0F || *ip.add(k + 1) != 0xAE || (*ip.add(k + 2) >> 3) & 7 != 6 {
+        return 0;
+    }
+    let Some(m) = modrm_len(ip.add(k + 2)) else { return 0 };
+    let len = k + 2 + m;
+    let mut old = 0u32;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    if VirtualProtect(ip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+        std::ptr::write_bytes(ip as *mut u8, 0x90, len);
+        VirtualProtect(ip as *const _, len, old, &mut old);
+        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(windows_sys::Win32::System::Threading::GetCurrentProcess(), ip as *const _, len);
+    }
+    ctx.Rip += len as u64;
+    let n = SITES.fetch_add(1, Ordering::Relaxed);
+    if n == 0 {
+        crate::xlog_warn!("CPU: CLWB is not available on this host – each site becomes NOPs when first reached (first at {})", modules::describe_address(ip as usize));
+    }
+    -1
+}
+
+/// A call or jump through a null (or near-null) pointer: logged with the return address and
+/// the registers, since the faulting address itself says nothing about the caller.
+unsafe extern "system" fn null_call_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    let rec = &*(*info).ExceptionRecord;
+    let ctx = &*(*info).ContextRecord;
+    if rec.ExceptionCode as u32 == 0xC000_0005 && ctx.Rip < 0x1_0000 && SEEN.fetch_add(1, Ordering::Relaxed) < 4 {
+        let ret = if crate::gpu::shader::readable(ctx.Rsp as usize, 8) { (ctx.Rsp as *const usize).read_unaligned() } else { 0 };
+        crate::xlog_error!(
+            "call through a null pointer (rip {:#x}): return address {}, rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} rbx={:#x} rsi={:#x} rdi={:#x}; on the stack: {}",
+            ctx.Rip, modules::describe_address(ret), ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.Rbx, ctx.Rsi, ctx.Rdi,
+            stack_callers(ctx.Rsp as usize)
+        );
+        crate::log::flush();
+    }
+    0
 }
 
 /// MSVC's x64 `__security_check_cookie` (vcruntime): `cmp rcx, [__security_cookie]; jne fail;

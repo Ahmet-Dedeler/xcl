@@ -25,8 +25,11 @@ extern "system" {
     fn WSASetLastError(e: i32);
 }
 
+/// Local change: on unless `XCL_NETWORK=1` asks for the network. A title under bring-up
+/// crashes often and its crash reporter uploads a memory dump each time, so no run may depend
+/// on someone remembering a variable.
 pub fn enabled() -> bool {
-    std::env::var("XCL_NETWORK").is_ok_and(|v| v.trim() == "0")
+    !std::env::var("XCL_NETWORK").is_ok_and(|v| v.trim() == "1")
 }
 
 /// (name, address, ws2_32 ordinal – 0: imported by name only)
