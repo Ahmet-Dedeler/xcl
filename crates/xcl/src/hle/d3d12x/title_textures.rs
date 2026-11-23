@@ -56,6 +56,15 @@ struct Entry {
     /// the present count when the content last changed or the texture was made (unwatched: it
     /// is looked at before every submit for a while after)
     changed: u64,
+    /// its content changed after the first upload (unwatched: a texture the CPU keeps writing
+    /// – a glyph cache, a video plane – is looked at every frame from then on)
+    dynamic: bool,
+    /// the title unmapped it since the last upload: what it wrote while it was mapped goes up
+    /// before its next submit
+    unmapped: bool,
+    /// the title maps and unmaps it (its writes are bracketed: an unwatched one is not
+    /// compared by content any more – a video's three sets of 4K planes would be 37 MiB a look)
+    map_tracked: bool,
 }
 
 /// textures waiting for their first upload
@@ -102,7 +111,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
             crate::xlog_info!("title texture trace: texture at {va:#x}, {size} bytes – write-watched, frame {}", frame_now());
         }
     }
-    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false, unwatched, sent: 0, changed: frame_now() };
+    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false, unwatched, sent: 0, changed: frame_now(), dynamic: false, unmapped: false, map_tracked: false };
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(old) = t.insert(res as usize, e) {
@@ -133,6 +142,59 @@ pub fn note_gpu_write(res: usize) {
 }
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// textures unmapped since their last upload
+static UNMAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The title unmapped texture `res` (`Map` gave it the texture's place in its memory,
+/// `real::res_map`): what it wrote there is uploaded before its next submit, whether the memory
+/// is write-watched or not.
+pub fn note_unmap(res: usize) {
+    let mut t = TEXTURES.lock().unwrap();
+    let Some(e) = t.get_mut(&res) else { return };
+    e.map_tracked = true;
+    if !e.unmapped {
+        e.unmapped = true;
+        UNMAPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    if trace_unwatched() && (k < 60 || k.is_power_of_two()) {
+        crate::xlog_info!("title texture trace: Unmap #{k} of the texture at {:#x} ({} bytes), frame {}", e.va, e.tex.size(), frame_now());
+    }
+}
+
+/// The traces: what the title's memory of texture `res` holds now – bytes that are not zero
+/// among 16 samples of 4 KiB, its content hash and the hash last uploaded.
+pub fn memory_summary(res: usize) -> String {
+    let Some((va, size, sent, flags)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.va, e.tex.size() as usize, e.sent, (e.unwatched, e.gpu_written, e.map_tracked, e.dynamic))) else { return String::new() };
+    let nonzero: usize = (0..16usize)
+        .map(|k| va + size.saturating_sub(4096) * k / 15)
+        .filter(|&a| crate::gpu::shader::readable(a, 4096.min(size)))
+        .map(|a| unsafe { std::slice::from_raw_parts(a as *const u8, 4096.min(size)).iter().filter(|&&b| b != 0).count() })
+        .sum();
+    format!(" [memory: {nonzero} of 65536 sampled bytes not zero, hash {:016x}, sent {sent:016x}, (unwatched, GPU-written, map-tracked, dynamic) {flags:?}]", unsafe { content_hash(va, size) })
+}
+
+/// The textures unmapped since their last upload (a reference each).
+unsafe fn take_unmapped() -> Vec<(ID3D12Resource, Upload)> {
+    if UNMAPPED.load(Ordering::Relaxed) == 0 {
+        return Vec::new();
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    t.iter_mut()
+        .filter(|(_, e)| e.unmapped)
+        .filter_map(|(&res, e)| {
+            e.unmapped = false;
+            UNMAPPED.fetch_sub(1, Ordering::Relaxed);
+            if e.pending || e.gpu_written {
+                return None; // (pending: its first upload takes the memory as it is now)
+            }
+            let p = res as *mut c_void;
+            ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.state)))
+        })
+        .collect()
+}
 
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
@@ -289,8 +351,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
             super::sparse::before_execute(q, &dirty, page as usize);
         });
     }
-    // textures in memory that is not write-watched: by content
+    // textures in memory that is not write-watched: by content; those the title unmapped
     let mut todo = poll_unwatched();
+    todo.extend(take_unmapped());
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         upload_all(todo);
         return;
@@ -370,14 +433,15 @@ fn note_unwatched(res: *mut c_void, va: usize, size: usize) {
     }
 }
 
-/// A texture is looked at before every submit for this many presented frames after its content
-/// last changed (a video's planes, a glyph cache being filled); after that, in turn.
-const HOT_FRAMES: u64 = 90;
-/// bytes of recently changed textures compared before one submit at most (the rest wait their
-/// turn with the others)
-const HOT_BYTES: usize = 96 << 20;
-/// bytes of the other textures compared before one submit (in turn; at least one texture)
-const TURN_BYTES: usize = 8 << 20;
+/// A texture is looked at before every submit for this many presented frames after it was made
+/// or its content last changed (a streamed texture being filled, a video's planes, a glyph
+/// cache while a page comes up).
+const HOT_FRAMES: u64 = 16;
+/// bytes of such textures compared before one submit at most (the rest wait their turn)
+const HOT_BYTES: usize = 64 << 20;
+/// bytes of the other textures compared before one submit (in turn; at least one texture): a
+/// texture that never changed is looked at again after (their bytes / this) submits
+const TURN_BYTES: usize = 2 << 20;
 
 /// A hash of `len` bytes at `at` for telling a change: four chains of 64-bit words (each step a
 /// bijection of its chain, so a change within one word always shows). Pages that are not
@@ -422,10 +486,12 @@ unsafe fn content_hash(at: usize, len: usize) -> u64 {
 }
 
 /// Textures in memory that is not write-watched whose content differs from what was last
-/// uploaded: those that changed in the last `HOT_FRAMES` frames are compared before every
+/// uploaded. Those made or changed in the last `HOT_FRAMES` frames are compared before every
 /// submit (what a list of this submit samples is complete by now – on the console the GPU reads
-/// the same memory), the others in turn, `TURN_BYTES` a submit.
+/// the same memory); those that ever changed after their first upload before the first submit
+/// of every frame; the others in turn, `TURN_BYTES` a submit.
 unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
+    static LAST_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static UNWATCHED: AtomicU64 = AtomicU64::new(0);
     static CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static LOOKS: AtomicU64 = AtomicU64::new(0);
@@ -433,6 +499,7 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
     static NANOS: AtomicU64 = AtomicU64::new(0);
     static CHANGED: AtomicU64 = AtomicU64::new(0);
     let frame = frame_now();
+    let new_frame = LAST_FRAME.swap(frame, Ordering::Relaxed) != frame;
     // (texture, address, bytes, hash last sent)
     let mut look: Vec<(usize, usize, usize, u64)> = Vec::new();
     let (count, total) = {
@@ -441,16 +508,21 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
         let mut cold: Vec<(usize, usize, usize, u64)> = Vec::new();
         let (mut count, mut total) = (0usize, 0usize);
         for (&res, e) in t.iter() {
-            if !e.unwatched || e.pending || e.gpu_written {
+            if !e.unwatched || e.pending || e.gpu_written || e.map_tracked {
                 continue;
             }
             let size = e.tex.size() as usize;
             count += 1;
             total += size;
-            if frame.saturating_sub(e.changed) < HOT_FRAMES && hot_bytes + size <= HOT_BYTES {
-                hot_bytes += size;
-                look.push((res, e.va, size, e.sent));
-            } else {
+            let hot = frame.saturating_sub(e.changed) < HOT_FRAMES;
+            if hot || (e.dynamic && new_frame) {
+                if hot_bytes + size <= HOT_BYTES {
+                    hot_bytes += size;
+                    look.push((res, e.va, size, e.sent));
+                } else {
+                    cold.push((res, e.va, size, e.sent));
+                }
+            } else if !e.dynamic {
                 cold.push((res, e.va, size, e.sent));
             }
         }
@@ -512,6 +584,7 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
             }
             e.sent = h;
             e.changed = frame;
+            e.dynamic = true;
             let k = CHANGED.fetch_add(1, Ordering::Relaxed);
             let p = res as *mut c_void;
             let r = ID3D12Resource::from_raw_borrowed(&p)?.clone();

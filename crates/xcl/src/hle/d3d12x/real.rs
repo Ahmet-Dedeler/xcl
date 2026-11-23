@@ -1169,6 +1169,13 @@ static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
     let Some((at, bytes)) = console_buffer(res) else {
         note_buffer_view();
+        if super::present::trace_window() {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 80 {
+                let d = unsafe { ID3D12Resource::from_raw_borrowed(&(res as *mut c_void)).map(|r| r.GetDesc()) };
+                crate::xlog_info!("window trace: buffer view (first {first}, {n} elements of {stride}, raw {raw}) of {res:#x} {:?} for title address {:x?}: not in unified memory – an empty V#", d.map(|d| (d.Width, d.Flags.0)), title_address(res));
+            }
+        }
         return [0; 4];
     };
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
@@ -1483,6 +1490,36 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
         return S_OK;
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
+    // a texture kept in step with the title's memory: its place there, as on the console. The
+    // PC's Map is not asked: a host whose D3D12 maps a texture in a default heap (D3DMetal)
+    // gives memory that is not the texture – a retail game decoded its videos' planes into it
+    // and the planes stayed empty. What the title writes is uploaded when it unmaps
+    // (`title_textures::note_unmap`).
+    if let Some(p) = super::title_textures::address(this as usize) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed);
+        if super::title_textures::trace_unwatched() && (k < 12 || k.is_power_of_two()) {
+            // (the first: what the PC's Map would have given)
+            let pc = if k < 4 {
+                let mut q: *mut c_void = std::ptr::null_mut();
+                let hr = f(this, sub, range, &mut q);
+                if hr >= 0 {
+                    let g: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
+                    g(this, sub, std::ptr::null());
+                }
+                format!("; the PC's Map: {:#x}, {q:p}", hr as u32)
+            } else {
+                String::new()
+            };
+            let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
+            crate::xlog_info!("title texture trace: Map #{k} (subresource {sub}) of {this:p} {:?} → its title memory {p:#x}{pc}; frame {}", d.map(|d| (d.Width, d.Height, d.Format.0, d.Flags.0)), super::present::counters().1);
+        }
+        if !data.is_null() {
+            *data = p as *mut c_void;
+        }
+        UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+        return S_OK;
+    }
     let hr = f(this, sub, range, data);
     if hr >= 0 {
         return hr;
@@ -1545,6 +1582,7 @@ static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c_void) {
     if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
+        super::title_textures::note_unmap(this as usize);
         return;
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
@@ -1703,6 +1741,12 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
     if !in_uma {
         note_buffer_view();
+        if super::present::trace_window() {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                crate::xlog_info!("window trace: constant buffer view of {size} bytes at {va:#x}: not in unified memory – an empty V#");
+            }
+        }
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
     super::console_heap::write(&slot, &crate::gpu::desc::buffer_words(va, 0, size, 22));
