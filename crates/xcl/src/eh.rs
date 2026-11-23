@@ -536,11 +536,51 @@ unsafe extern "system" fn unsupported_insn_handler(info: *mut EXCEPTION_POINTERS
     -1
 }
 
+/// A retail title's stall watchdog (GTA VI 1.0.2.1, exe+0x2215b91..): a thread walks 64
+/// heartbeat slots and, when one is older than its limit, calls a hook (which stores to
+/// address 0 and returns) and then stores to address 0 itself – a deliberate crash that sends
+/// a report. A host that is slow for a moment (shader compiles, other programs) trips it
+/// although nothing hangs. Both stores are recognised by their bytes and the watchdog goes
+/// on as if it had found no stale slot (`XCL_TITLE_WATCHDOG=1`: the crash stays).
+unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    let rip = ctx.Rip as usize;
+    if rip < 0x1_0000 || *KEEP.get_or_init(|| std::env::var("XCL_TITLE_WATCHDOG").is_ok_and(|v| v.trim() == "1")) || !crate::gpu::shader::readable(rip.wrapping_sub(0x42), 0x4E) {
+        return false;
+    }
+    let at = |a: usize, n: usize| std::slice::from_raw_parts(a as *const u8, n);
+    // mov dword ptr [0], imm32
+    if at(rip, 7) != [0xC7, 0x04, 0x25, 0, 0, 0, 0] {
+        return false;
+    }
+    // the hook: `mov dword ptr [0], 0x2ef1e94b; ret`
+    if at(rip + 7, 5) == [0x4B, 0xE9, 0xF1, 0x2E, 0xC3] {
+        ctx.Rip += 11;
+        return true;
+    }
+    // the watchdog: `mov r14, rsi; mov ebx, ebp` 0x29 bytes before, `mov r15, [rip+..]; mov r14, rsi;
+    // mov ebp, 0x1e` (the path taken when no slot is stale) 0x42 bytes before
+    if at(rip + 7, 5) == [0, 0, 0, 0, 0xCC] && at(rip - 0x29, 5) == [0x49, 0x89, 0xF6, 0x89, 0xEB] && at(rip - 0x42, 3) == [0x4C, 0x8B, 0x3D] && at(rip - 0x3B, 8) == [0x49, 0x89, 0xF6, 0xBD, 0x1E, 0, 0, 0] {
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        if n < 4 || n.is_power_of_two() {
+            crate::xlog_warn!("the title's stall watchdog fired (#{n}: a thread's heartbeat is older than its limit) – its deliberate crash is skipped and the title goes on (XCL_TITLE_WATCHDOG=1 keeps the crash)");
+        }
+        ctx.Rsi = ctx.R14;
+        ctx.Rip -= 0x42;
+        return true;
+    }
+    false
+}
+
 /// A call or jump through a null (or near-null) pointer: logged with the return address and
 /// the registers, since the faulting address itself says nothing about the caller.
 unsafe extern "system" fn null_call_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
     static SEEN: AtomicUsize = AtomicUsize::new(0);
     let rec = &*(*info).ExceptionRecord;
+    if rec.ExceptionCode as u32 == 0xC000_0005 && title_watchdog_resume(&mut *(*info).ContextRecord) {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
     let ctx = &*(*info).ContextRecord;
     if rec.ExceptionCode as u32 == 0xC000_0005 && ctx.Rip < 0x1_0000 && SEEN.fetch_add(1, Ordering::Relaxed) < 4 {
         let ret = if crate::gpu::shader::readable(ctx.Rsp as usize, 8) { (ctx.Rsp as *const usize).read_unaligned() } else { 0 };
