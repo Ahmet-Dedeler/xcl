@@ -201,8 +201,13 @@ fn dump_dir() -> PathBuf {
     crate::state::data_dir().join("shaders")
 }
 
+/// Set when the host's D3D12 is native code outside any PE module (Apple's D3DMetal under
+/// Wine): its objects and blobs live in memory VirtualQuery reports as free.
+pub static NATIVE_HOST_MEMORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
-/// when our guess of a console struct layout is wrong.)
+/// when our guess of a console struct layout is wrong.) On a native host, memory Windows
+/// does not know is probed by reading it under an exception guard.
 pub fn readable(p: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     if p == 0 || len == 0 || len > 256 << 20 {
@@ -216,6 +221,9 @@ pub fn readable(p: usize, len: usize) -> bool {
     while cur < end {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let n = unsafe { VirtualQuery(cur as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if (n == 0 || mbi.State == windows_sys::Win32::System::Memory::MEM_FREE) && NATIVE_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed) {
+            return unsafe { windows_sys::Win32::System::Memory::IsBadReadPtr(cur as *const _, end - cur) } == 0;
+        }
         if n == 0 || mbi.State != MEM_COMMIT || mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 || mbi.Protect == 0 {
             return false;
         }
