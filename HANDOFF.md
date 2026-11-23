@@ -1828,3 +1828,36 @@ Little is left to do without the exe – the rest needs an actual run of the gam
 - Seen: sign-in screen (#20202C, bottom bar), after A the intro video as flat 0xff008700 (its three planes sample
   as zero), then a front-end page with part of its text missing. `XCL_TRACE_FRAME` + `XCL_FRAME_DUMP` hung once at
   the dump of frame 470 (not diagnosed); `present::forget` drops freed resources from the trace's lists.
+
+## The front end's body text on a Mac (lane text-video, 2026-11-24; D3DMetal, 5 live runs)
+- **Why most letters were missing:** the title's UI library (Scaleform) draws large glyphs as shapes and small
+  ones (the regular font's x-height letters, punctuation) from a glyph cache – a 2048x2048 A8 texture it placed in
+  its own memory and writes on the CPU for the rest of the run (it maps it once, unmaps it and keeps the pointer).
+  On a native host that memory is not write-watched (graphics memory by protection stays the system's, see
+  above), so `title_textures` uploaded the empty cache once and never again.
+- **Now:** a texture whose memory is not write-watched is compared with what was last uploaded
+  (`title_textures::poll_unwatched`, a 64-bit hash of its memory, ~6 GB/s under Rosetta): one that changed in the
+  last 16 frames before every submit, one that ever changed before the first submit of every frame, the others in
+  turn (2 MiB a submit, the textures of the last 300 frames in a turn of their own). An Unmap of a title texture
+  uploads it before the next submit. `Chain::detile_level` works a row at a time (a linear level is copied).
+  Measured in the front end: 815 textures / 970 MiB unwatched, ~2 ms a frame.
+- Not covered: a texture that never changed is found late (up to ~160 frames in the front end, longer with more
+  texture memory in the game) – streamed textures should be told by who writes them (DirectStorage,
+  MapTitlePhysicalPages) instead; GPU-owned textures placed at addresses that are no multiple of 64 KiB fall out of
+  `vram::place` and get resources of their own (their format-67 aliases never see the UAV's writes).
+- **BCPack** is not what removed the letters: with the refusals counted (upstream PR #201, applied here) the front
+  end asks for BC1 / BC5 / BC7 chunks while its pages load, all refused; those are its images, not its text.
+- **The intro video** (not fixed here): its planes are nine R8 title textures (three sets of 3840x2160 +
+  2 x 1920x1080, made before the sign-in screen) whose memory never changes while the video plays. The title's
+  texture lock (image +0x5121690) calls Map and, when the pointer lies in the range [+0x9e1dad0] of size
+  [+0x9e1dac8], moves it to the same offset from [+0x9e1dac0] – a second view of that memory, it seems, and the
+  pointers it registers with Bink (BinkRegisterFrameBuffers at +0x442f9b8, CPU decoding) would be in it. Read from
+  the code, not checked in a run: the three globals' values, and whether the planes' addresses are in the range.
+  If so: `kernelx::map_pages` gives a physical page one address at a time (the earlier mapping is decommitted), so
+  what is written through the second view never shows at the texture's address. (The PC's Map of such a texture
+  fails with E_INVALIDARG on D3DMetal too: `res_map` gives the title address, as on Windows.)
+- Switches: `XCL_TRACE_TITLE_TEXTURES=1` (unwatched textures, uploads after a change, totals every 256 looks),
+  `XCL_TRACE_WINDOW=a,b` (draws / dispatches with their root arguments and table slots between a and b seconds
+  after the first gamepad press; no GPU work of its own), `XCL_TRANSLATED_IDENT=<hex>` (builds that differ outside
+  the translator share the translation cache: a new build's first run otherwise translates ~1 500 programs again,
+  four minutes on this host). Run with `keyboard_mouse = false` in xcl.toml when someone else types on the machine.

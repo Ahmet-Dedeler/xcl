@@ -53,18 +53,21 @@ struct Entry {
     unwatched: bool,
     /// `content_hash` of the memory at the last upload (unwatched textures)
     sent: u64,
-    /// the present count when the content last changed or the texture was made (unwatched: it
-    /// is looked at before every submit for a while after)
+    /// the present count when the content last changed (unwatched: it is looked at before
+    /// every submit for a while after)
     changed: u64,
     /// its content changed after the first upload (unwatched: a texture the CPU keeps writing
     /// – a glyph cache, a video plane – is looked at every frame from then on)
     dynamic: bool,
     /// the title unmapped it since the last upload: what it wrote while it was mapped goes up
-    /// before its next submit
+    /// before its next submit. (No more than that: a retail game maps its glyph cache once,
+    /// unmaps it and writes through the pointer for the rest of the run.)
     unmapped: bool,
-    /// the title maps and unmaps it (its writes are bracketed: an unwatched one is not
-    /// compared by content any more – a video's three sets of 4K planes would be 37 MiB a look)
-    map_tracked: bool,
+    /// the title mapped it at least once: one it means to write (unwatched: these have a turn
+    /// of their own until their content first changes)
+    mapped: bool,
+    /// the present count when it was made (unwatched: young textures have a turn of their own)
+    made: u64,
 }
 
 /// textures waiting for their first upload
@@ -111,7 +114,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
             crate::xlog_info!("title texture trace: texture at {va:#x}, {size} bytes – write-watched, frame {}", frame_now());
         }
     }
-    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false, unwatched, sent: 0, changed: frame_now(), dynamic: false, unmapped: false, map_tracked: false };
+    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false, unwatched, sent: 0, changed: 0, dynamic: false, unmapped: false, mapped: false, made: frame_now() };
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(old) = t.insert(res as usize, e) {
@@ -152,7 +155,7 @@ static UNMAPPED: AtomicU64 = AtomicU64::new(0);
 pub fn note_unmap(res: usize) {
     let mut t = TEXTURES.lock().unwrap();
     let Some(e) = t.get_mut(&res) else { return };
-    e.map_tracked = true;
+    e.mapped = true;
     if !e.unmapped {
         e.unmapped = true;
         UNMAPPED.fetch_add(1, Ordering::Relaxed);
@@ -167,13 +170,13 @@ pub fn note_unmap(res: usize) {
 /// The traces: what the title's memory of texture `res` holds now – bytes that are not zero
 /// among 16 samples of 4 KiB, its content hash and the hash last uploaded.
 pub fn memory_summary(res: usize) -> String {
-    let Some((va, size, sent, flags)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.va, e.tex.size() as usize, e.sent, (e.unwatched, e.gpu_written, e.map_tracked, e.dynamic))) else { return String::new() };
+    let Some((va, size, sent, flags)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.va, e.tex.size() as usize, e.sent, (e.unwatched, e.gpu_written, e.dynamic))) else { return String::new() };
     let nonzero: usize = (0..16usize)
         .map(|k| va + size.saturating_sub(4096) * k / 15)
         .filter(|&a| crate::gpu::shader::readable(a, 4096.min(size)))
         .map(|a| unsafe { std::slice::from_raw_parts(a as *const u8, 4096.min(size)).iter().filter(|&&b| b != 0).count() })
         .sum();
-    format!(" [memory: {nonzero} of 65536 sampled bytes not zero, hash {:016x}, sent {sent:016x}, (unwatched, GPU-written, map-tracked, dynamic) {flags:?}]", unsafe { content_hash(va, size) })
+    format!(" [memory: {nonzero} of 65536 sampled bytes not zero, hash {:016x}, sent {sent:016x}, (unwatched, GPU-written, dynamic) {flags:?}]", unsafe { content_hash(va, size) })
 }
 
 /// The textures unmapped since their last upload (a reference each).
@@ -360,7 +363,6 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
-    let frame = frame_now();
     let first: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
@@ -382,7 +384,6 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     if e.unwatched {
                         // what goes up now is what later looks compare with
                         e.sent = content_hash(e.va, e.tex.size() as usize);
-                        e.changed = frame;
                     }
                 }
                 let p = res as *mut c_void;
@@ -433,15 +434,76 @@ fn note_unwatched(res: *mut c_void, va: usize, size: usize) {
     }
 }
 
-/// A texture is looked at before every submit for this many presented frames after it was made
-/// or its content last changed (a streamed texture being filled, a video's planes, a glyph
-/// cache while a page comes up).
+/// A texture is looked at before every submit for this many presented frames after its content
+/// last changed (a glyph cache while a page comes up, a streamed texture being filled).
 const HOT_FRAMES: u64 = 16;
 /// bytes of such textures compared before one submit at most (the rest wait their turn)
 const HOT_BYTES: usize = 64 << 20;
-/// bytes of the other textures compared before one submit (in turn; at least one texture): a
-/// texture that never changed is looked at again after (their bytes / this) submits
+/// bytes of the textures that never changed compared before one submit, in turn (at least one
+/// texture): one is looked at again after (their bytes / this) submits – with a retail game's
+/// front end, 970 MiB in 815 textures, after about 160 frames. There are three turns of this
+/// size: the textures the title mapped (it means to write them: a glyph cache is found within
+/// a few frames of its first glyphs), those made in the last `YOUNG_FRAMES` frames (one filled
+/// after it was made shows sooner), and the rest.
 const TURN_BYTES: usize = 2 << 20;
+const YOUNG_FRAMES: u64 = 300;
+
+/// What `pick` needs of a texture in memory that is not write-watched.
+#[derive(Clone, Copy)]
+struct Seen {
+    /// its key in `TEXTURES` (the turns go by it)
+    key: usize,
+    size: usize,
+    dynamic: bool,
+    mapped: bool,
+    changed: u64,
+    made: u64,
+}
+
+/// The textures of `all` (ascending keys) to compare before this submit, as indices: those
+/// whose content changed in the last `HOT_FRAMES` frames; at a frame's first submit
+/// (`new_frame`) those that ever changed; and of each turn (`cursors`: the key each stopped at)
+/// the next `TURN_BYTES`, at least one texture.
+fn pick(all: &[Seen], frame: u64, new_frame: bool, cursors: &mut [usize; 3]) -> Vec<usize> {
+    let mut look = Vec::new();
+    let mut hot_bytes = 0usize;
+    // (the rest, the young, the mapped)
+    let mut turns: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (i, e) in all.iter().enumerate() {
+        let turn = if e.mapped {
+            2
+        } else if frame.saturating_sub(e.made) < YOUNG_FRAMES {
+            1
+        } else {
+            0
+        };
+        let hot = e.dynamic && frame.saturating_sub(e.changed) < HOT_FRAMES;
+        if hot || (e.dynamic && new_frame) {
+            if hot_bytes + e.size <= HOT_BYTES {
+                hot_bytes += e.size;
+                look.push(i);
+            } else {
+                turns[turn].push(i);
+            }
+        } else if !e.dynamic {
+            turns[turn].push(i);
+        }
+    }
+    for (turn, cursor) in turns.iter().zip(cursors.iter_mut()) {
+        let start = turn.partition_point(|&i| all[i].key <= *cursor);
+        let mut bytes = 0usize;
+        for k in 0..turn.len() {
+            let i = turn[(start + k) % turn.len()];
+            if k > 0 && bytes + all[i].size > TURN_BYTES {
+                break;
+            }
+            bytes += all[i].size;
+            *cursor = all[i].key;
+            look.push(i);
+        }
+    }
+    look
+}
 
 /// A hash of `len` bytes at `at` for telling a change: four chains of 64-bit words (each step a
 /// bijection of its chain, so a change within one word always shows). Pages that are not
@@ -486,14 +548,14 @@ unsafe fn content_hash(at: usize, len: usize) -> u64 {
 }
 
 /// Textures in memory that is not write-watched whose content differs from what was last
-/// uploaded. Those made or changed in the last `HOT_FRAMES` frames are compared before every
+/// uploaded. Those that changed in the last `HOT_FRAMES` frames are compared before every
 /// submit (what a list of this submit samples is complete by now – on the console the GPU reads
 /// the same memory); those that ever changed after their first upload before the first submit
-/// of every frame; the others in turn, `TURN_BYTES` a submit.
+/// of every frame; the others in turn (`pick`).
 unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
     static LAST_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static UNWATCHED: AtomicU64 = AtomicU64::new(0);
-    static CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static CURSORS: Mutex<[usize; 3]> = Mutex::new([0; 3]);
     static LOOKS: AtomicU64 = AtomicU64::new(0);
     static HASHED: AtomicU64 = AtomicU64::new(0);
     static NANOS: AtomicU64 = AtomicU64::new(0);
@@ -501,47 +563,19 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
     let frame = frame_now();
     let new_frame = LAST_FRAME.swap(frame, Ordering::Relaxed) != frame;
     // (texture, address, bytes, hash last sent)
-    let mut look: Vec<(usize, usize, usize, u64)> = Vec::new();
-    let (count, total) = {
+    let (look, count, total): (Vec<(usize, usize, usize, u64)>, usize, usize) = {
         let t = TEXTURES.lock().unwrap();
-        let mut hot_bytes = 0usize;
-        let mut cold: Vec<(usize, usize, usize, u64)> = Vec::new();
-        let (mut count, mut total) = (0usize, 0usize);
+        let mut all: Vec<Seen> = Vec::new();
+        let mut places: Vec<(usize, u64)> = Vec::new();
         for (&res, e) in t.iter() {
-            if !e.unwatched || e.pending || e.gpu_written || e.map_tracked {
+            if !e.unwatched || e.pending || e.gpu_written {
                 continue;
             }
-            let size = e.tex.size() as usize;
-            count += 1;
-            total += size;
-            let hot = frame.saturating_sub(e.changed) < HOT_FRAMES;
-            if hot || (e.dynamic && new_frame) {
-                if hot_bytes + size <= HOT_BYTES {
-                    hot_bytes += size;
-                    look.push((res, e.va, size, e.sent));
-                } else {
-                    cold.push((res, e.va, size, e.sent));
-                }
-            } else if !e.dynamic {
-                cold.push((res, e.va, size, e.sent));
-            }
+            all.push(Seen { key: res, size: e.tex.size() as usize, dynamic: e.dynamic, mapped: e.mapped, changed: e.changed, made: e.made });
+            places.push((e.va, e.sent));
         }
-        // the others in turn from where the last look stopped
-        let cursor = CURSOR.load(Ordering::Relaxed);
-        let start = cold.partition_point(|c| c.0 <= cursor);
-        let mut bytes = 0usize;
-        let mut last = cursor;
-        for k in 0..cold.len() {
-            let c = cold[(start + k) % cold.len()];
-            if k > 0 && bytes + c.2 > TURN_BYTES {
-                break;
-            }
-            bytes += c.2;
-            last = c.0;
-            look.push(c);
-        }
-        CURSOR.store(last, Ordering::Relaxed);
-        (count, total)
+        let picked = pick(&all, frame, new_frame, &mut CURSORS.lock().unwrap());
+        (picked.into_iter().map(|i| (all[i].key, places[i].0, all[i].size, places[i].1)).collect(), all.len(), all.iter().map(|e| e.size).sum())
     };
     UNWATCHED.store(count as u64, Ordering::Relaxed);
     if look.is_empty() {
@@ -854,6 +888,107 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seen(key: usize, size: usize) -> Seen {
+        Seen { key, size, dynamic: false, mapped: false, changed: 0, made: 0 }
+    }
+
+    /// Textures that never changed are all looked at within about (their bytes / `TURN_BYTES`)
+    /// submits, a texture larger than a turn included.
+    #[test]
+    fn every_unchanged_texture_gets_its_turn() {
+        let all: Vec<Seen> = (0..200).map(|k| seen(0x1000 + k, if k == 7 { 5 << 20 } else { 300 << 10 })).collect();
+        let total: usize = all.iter().map(|e| e.size).sum();
+        let mut cursors = [0usize; 3];
+        let mut seen_at = vec![0usize; all.len()];
+        let looks = total / TURN_BYTES + all.len();
+        let mut picked = 0;
+        for look in 1..=looks {
+            for i in pick(&all, 1000, look % 3 == 1, &mut cursors) {
+                if seen_at[i] == 0 {
+                    seen_at[i] = look;
+                    picked += 1;
+                }
+            }
+            if picked == all.len() {
+                break;
+            }
+        }
+        assert_eq!(picked, all.len(), "all looked at");
+        let last = *seen_at.iter().max().unwrap();
+        // (a submit takes whole textures: at least a turn less one of them)
+        assert!(last <= total / (TURN_BYTES - (300 << 10)) + 2, "after {last} submits for {} MiB", total >> 20);
+        // one submit compares one turn's bytes (or its one large texture)
+        let n: usize = pick(&all, 1000, false, &mut cursors).iter().map(|&i| all[i].size).sum();
+        assert!(n <= TURN_BYTES.max(5 << 20));
+    }
+
+    /// A texture whose content changed is looked at before every submit for `HOT_FRAMES`
+    /// frames, then before each frame's first submit; one the title mapped is found in its own
+    /// turn however many others wait; the young have theirs.
+    #[test]
+    fn changed_mapped_and_young_textures_come_first() {
+        let mut all: Vec<Seen> = (0..500).map(|k| seen(0x1000 + k, 2 << 20)).collect();
+        all[300].dynamic = true;
+        all[300].changed = 990;
+        all[450].mapped = true; // a glyph cache: mapped once, never changed so far
+        all[451].mapped = true;
+        all[20].made = 900; // made 100 frames ago
+        let mut cursors = [0usize; 3];
+        let frame = 1000;
+        // hot: every submit
+        for new_frame in [true, false, false] {
+            assert!(pick(&all, frame, new_frame, &mut cursors).contains(&300));
+        }
+        // the two mapped textures alternate: each within two submits
+        let a = pick(&all, frame, false, &mut cursors);
+        let b = pick(&all, frame, false, &mut cursors);
+        assert!(a.contains(&450) != a.contains(&451));
+        assert!(a.contains(&450) != b.contains(&450));
+        // the young one: every submit (it is the only one in its turn)
+        assert!(a.contains(&20) && b.contains(&20));
+        // no longer hot: the first submit of a frame only
+        let later = frame + HOT_FRAMES + 50;
+        assert!(pick(&all, later, true, &mut cursors).contains(&300));
+        assert!(!pick(&all, later, false, &mut cursors).contains(&300));
+        // a changed texture is not in a turn as well
+        assert_eq!(pick(&all, later, true, &mut cursors).iter().filter(|&&i| i == 300).count(), 1);
+    }
+
+    /// More changed textures than `HOT_BYTES`: the rest are looked at in their turn.
+    #[test]
+    fn hot_textures_over_the_limit_wait_their_turn() {
+        let mut all: Vec<Seen> = (0..40).map(|k| seen(0x1000 + k, 4 << 20)).collect();
+        for e in all.iter_mut() {
+            e.dynamic = true;
+            e.changed = 100;
+        }
+        let mut cursors = [0usize; 3];
+        let mut got = vec![false; all.len()];
+        for _ in 0..40 {
+            let p = pick(&all, 101, false, &mut cursors);
+            assert!(p.iter().map(|&i| all[i].size).sum::<usize>() <= HOT_BYTES + (4 << 20));
+            p.into_iter().for_each(|i| got[i] = true);
+        }
+        assert!(got.iter().all(|&g| g));
+    }
+
+    /// The content hash tells a change of one byte anywhere and reads what it is given.
+    #[test]
+    fn content_hash_tells_a_one_byte_change() {
+        let mut m = vec![0u8; 3 * 4096 + 37];
+        for (i, b) in m.iter_mut().enumerate() {
+            *b = (i * 31 >> 3) as u8;
+        }
+        let h = unsafe { content_hash(m.as_ptr() as usize, m.len()) };
+        assert_eq!(h, unsafe { content_hash(m.as_ptr() as usize, m.len()) });
+        for at in [0usize, 1, 31, 32, 4095, 4096, 8191, m.len() - 38, m.len() - 1] {
+            m[at] ^= 0x10;
+            assert_ne!(h, unsafe { content_hash(m.as_ptr() as usize, m.len()) }, "byte {at}");
+            m[at] ^= 0x10;
+        }
+        assert_ne!(h, unsafe { content_hash(m.as_ptr() as usize, m.len() - 1) });
+    }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
     #[test]
