@@ -259,7 +259,48 @@ fn scripted() -> u32 {
     });
     // seconds since the host started, as the log's times (not since the title first polled)
     let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g) | remote()
+}
+
+/// `XCL_REMOTE_INPUT=<file>`: buttons written to that file ("A", "DOWN A", names as
+/// `XCL_PRESS_AT`'s) are held for 250 ms each time the file changes – a running title driven
+/// from outside (a script, another program) without its window having the focus.
+fn remote() -> u32 {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant, SystemTime};
+    struct R {
+        checked: Instant,
+        seen: Option<SystemTime>,
+        buttons: u32,
+        until: Instant,
+    }
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    static STATE: Mutex<Option<R>> = Mutex::new(None);
+    let Some(path) = PATH.get_or_init(|| std::env::var("XCL_REMOTE_INPUT").ok().filter(|p| !p.trim().is_empty())) else { return 0 };
+    let now = Instant::now();
+    let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let r = g.get_or_insert_with(|| R {
+        checked: now - Duration::from_secs(1),
+        // what is in the file when the title starts is not a press
+        seen: std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+        buttons: 0,
+        until: now,
+    });
+    if now.duration_since(r.checked) >= Duration::from_millis(50) {
+        r.checked = now;
+        let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if modified.is_some() && modified != r.seen {
+            r.seen = modified;
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let b = text.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).filter_map(|s| button_named(&s.to_ascii_uppercase())).fold(0, |b, g| b | g);
+            if b != 0 {
+                r.buttons = b;
+                r.until = now + Duration::from_millis(250);
+                crate::xlog_info!("GameInput: remote input {:?} → buttons {b:#x}", text.trim());
+            }
+        }
+    }
+    if now < r.until { r.buttons } else { 0 }
 }
 
 #[link(name = "user32")]
