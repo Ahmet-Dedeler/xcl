@@ -269,7 +269,8 @@ unsafe fn loopback_of(name: *const u8, len: i32) -> Option<Vec<u8>> {
 unsafe extern "system" fn bind(s: usize, name: *const u8, len: i32) -> i32 {
     match loopback_of(name, len) {
         Some(a) => {
-            note("bind to an address other than loopback (bound to loopback)");
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_info!("XCL_NETWORK=0: a socket bound to an address other than loopback is bound to loopback"));
             real_bind(s, a.as_ptr(), len)
         }
         None => real_bind(s, name, len),
