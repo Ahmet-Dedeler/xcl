@@ -422,7 +422,8 @@ fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &st
     h
 }
 
-fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
+/// Key of a program's DXIL in the disk cache (the file is `<key>.dxil`).
+pub(super) fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key_for_toolchain(src, entry, profile, toolchain_identity())
 }
 
@@ -646,7 +647,48 @@ fn compile_cached_in_observed<F>(
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
-    let key = cache_key(src, entry, profile);
+    compile_cached_keyed(dir, cache_key(src, entry, profile), src, entry, profile, counters, compile_one)
+}
+
+/// `compile_cached_in` for a caller that has `cache_key(src, entry, profile)` already (the
+/// key hashes the whole source).
+pub(super) fn compile_cached_in_keyed(dir: &Path, key: u64, src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
+    compile_cached_keyed(dir, key, src, entry, profile, cache_counters(), || compile(src, entry, profile, &[]))
+}
+
+/// The cached DXIL with this key, without its source: Ok(None) when it is not there (the
+/// caller needs the source to compile it); inside `cached_only` that is a miss (Err), as in
+/// `compile_cached`. Outside, a compile of it that is running is waited for.
+pub(super) fn cached_by_key_in(dir: &Path, key: u64) -> Result<Option<Vec<u8>>, String> {
+    cached_by_key(dir, key, cache_counters())
+}
+
+fn cached_by_key(dir: &Path, key: u64, counters: &CacheCounters) -> Result<Option<Vec<u8>>, String> {
+    let dir = normalized_cache_dir(dir);
+    let file = dir.join(format!("{key:016x}.dxil"));
+    if let Some(b) = cached_file(&file) {
+        counters.hits.fetch_add(1, Ordering::Relaxed);
+        return Ok(Some(b));
+    }
+    if CACHED_ONLY.with(|c| c.get()) {
+        counters.deferred_misses.fetch_add(1, Ordering::Relaxed);
+        MISSED.with(|m| m.set(true));
+        return Err("DXIL not compiled yet".into());
+    }
+    let flight = cache_flight((dir, key));
+    let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
+    let found = cached_file(&file);
+    if found.is_some() {
+        counters.misses.fetch_add(1, Ordering::Relaxed);
+        counters.coalesced_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(found)
+}
+
+fn compile_cached_keyed<F>(dir: &Path, key: u64, src: &str, entry: &str, profile: &str, counters: &CacheCounters, compile_one: F) -> Result<(Vec<u8>, bool), String>
+where
+    F: FnOnce() -> Result<Vec<u8>, String>,
+{
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
     if let Some(b) = cached_file(&file) {
@@ -811,12 +853,12 @@ mod heap_tests {
 }
 
 #[cfg(test)]
-mod cache_tests {
+pub(super) mod cache_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    fn synthetic_dxil(marker: u8) -> Vec<u8> {
+    pub(in crate::gpu::recomp) fn synthetic_dxil(marker: u8) -> Vec<u8> {
         let mut b = vec![0u8; 68];
         b[..4].copy_from_slice(b"DXBC");
         b[20..24].copy_from_slice(&1u32.to_le_bytes());
@@ -828,6 +870,46 @@ mod cache_tests {
         b[52..56].copy_from_slice(b"DXIL"); // inner DxilBitcodeHeader magic
         b[67] = marker;
         b
+    }
+
+    #[test]
+    fn dxil_by_key_needs_no_source_and_waits_for_a_running_compile() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-by-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let counters = CacheCounters::default();
+        let src = "by key";
+        let key = cache_key(src, "main", "cs_6_6");
+        // not compiled: a miss inside cached_only, "translate and compile" outside
+        let (r, missed) = cached_only(|| cached_by_key(&dir, key, &counters));
+        assert!(r.is_err() && missed);
+        assert_eq!(cached_by_key(&dir, key, &counters), Ok(None));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let (dir, counters) = (&dir, &counters);
+            let compiling = scope.spawn(move || {
+                compile_cached_keyed(dir, key, src, "main", "cs_6_6", counters, || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(synthetic_dxil(3))
+                })
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // a probe does not wait for it
+            let (r, missed) = cached_only(|| cached_by_key(dir, key, counters));
+            assert!(r.is_err() && missed);
+            let waiting = scope.spawn(move || cached_by_key(dir, key, counters));
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!waiting.is_finished());
+            release_tx.send(()).unwrap();
+            assert_eq!(compiling.join().unwrap().unwrap(), (synthetic_dxil(3), false));
+            assert_eq!(waiting.join().unwrap(), Ok(Some(synthetic_dxil(3))));
+        });
+        assert_eq!(cached_by_key(&dir, key, &counters), Ok(Some(synthetic_dxil(3))));
+        let stats = counters.snapshot();
+        assert_eq!((stats.compilations, stats.deferred_misses, stats.coalesced_hits, stats.hits), (1, 2, 1, 1));
+        assert_eq!(stats.misses, 1 + stats.coalesced_hits);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
