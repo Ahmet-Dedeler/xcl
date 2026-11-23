@@ -241,7 +241,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
-        list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        let pso = super::pso_async::resolve(with(this, |s| s.pso));
+        if !super::list_x::draw_rects(this, &list, pso, vertices, instances, first_vertex, first_instance) {
+            list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        }
     }
 }
 

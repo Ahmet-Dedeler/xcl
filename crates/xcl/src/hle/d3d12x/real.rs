@@ -1609,6 +1609,14 @@ static PSO_SHADERS: Mutex<Option<HashMap<usize, (u64, u64)>>> = Mutex::new(None)
 /// translated pipeline → its input layout as text (`XCL_TRACE_FRAME`)
 static PSO_LAYOUTS: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
 
+/// translated pipeline → its input elements: (is the position, format, slot, byte offset) –
+/// what a rect list's fourth vertex is made from (`list_x::draw_rects`)
+static PSO_ELEMENTS: Mutex<Option<HashMap<usize, Vec<(bool, i32, u32, u32)>>>> = Mutex::new(None);
+
+pub fn pso_elements(pso: usize) -> Option<Vec<(bool, i32, u32, u32)>> {
+    PSO_ELEMENTS.lock().unwrap().as_ref()?.get(&pso).cloned()
+}
+
 pub fn pso_layout(pso: usize) -> Option<String> {
     PSO_LAYOUTS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
@@ -3205,6 +3213,16 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    {
+        let il = &d.InputLayout;
+        if il.NumElements > 0 && il.NumElements <= 32 && !il.pInputElementDescs.is_null() {
+            let elems: Vec<(bool, i32, u32, u32)> = std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize)
+                .iter()
+                .map(|e| (e.SemanticIndex == 0 && e.SemanticName.to_string().is_ok_and(|n| n.eq_ignore_ascii_case("POSITION")), e.Format.0, e.InputSlot, e.AlignedByteOffset))
+                .collect();
+            PSO_ELEMENTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, elems);
+        }
+    }
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));

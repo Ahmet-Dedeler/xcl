@@ -247,6 +247,8 @@ struct RenderTargets {
 struct Bindings {
     heaps: Vec<usize>,
     topology: Option<u32>,
+    /// the title set the console's rect list topology (the PC list has a triangle list)
+    rect_list: bool,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<windows::Win32::Foundation::RECT>,
     blend: Option<[f32; 4]>,
@@ -412,9 +414,11 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
             n
         };
         if new {
-            crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists (each rect's first half only)" } else { "" });
+            crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as two triangles a rect from a copy of their vertices (`draw_rects`; else each rect's first half only)" } else { "" });
         }
     }
+    let rects = t == RECT_LIST;
+    with_bindings(this, |b| b.rect_list = rects);
     let t = if t == RECT_LIST { windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 } else { t };
     with_bindings(this, |b| b.topology = Some(t));
     pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_IA_SET_PRIMITIVE_TOPOLOGY)(this, t)
@@ -530,6 +534,8 @@ struct ListState {
     cpu_writes: Vec<super::cpu_writes::Write>,
     /// geometry in ordinary memory this recording names, and its copies (`cpu_geometry`)
     cpu_copies: Vec<CpuCopy>,
+    /// rect lists this recording draws as triangles (`draw_rects`)
+    rect_copies: Vec<RectCopy>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
 }
@@ -1756,6 +1762,127 @@ pub(super) unsafe fn cpu_geometry_before_execute(lists: &[*mut c_void]) {
             std::ptr::copy_nonoverlapping(c.src as *const u8, c.dst as *mut u8, c.len);
         }
     }
+    let rects: Vec<RectCopy> = {
+        let g = LISTS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.rect_copies.iter().cloned()).collect()
+    };
+    for c in &rects {
+        expand_rects(c);
+    }
+}
+
+/// A rect list's vertices and the triangle list made of them (`draw_rects`).
+#[derive(Clone)]
+struct RectCopy {
+    src: usize,
+    stride: usize,
+    rects: usize,
+    dst: usize,
+    elems: Vec<(bool, i32, u32, u32)>,
+}
+
+/// bytes of a vertex element XCL can make a rect's fourth corner of: (bytes, floats)
+fn rect_element(format: i32) -> Option<(usize, bool)> {
+    Some(match format {
+        2 => (16, true),          // R32G32B32A32_FLOAT
+        6 => (12, true),          // R32G32B32_FLOAT
+        16 => (8, true),          // R32G32_FLOAT
+        41 => (4, true),          // R32_FLOAT
+        28 | 29 | 87 | 91 => (4, false), // R8G8B8A8 / B8G8R8A8 UNORM
+        _ => return None,
+    })
+}
+
+/// Each rect (three corners) as two triangles: the fourth corner is opposite the corner that
+/// faces the longest edge (the diagonal), every element of it `b + c - a`.
+unsafe fn expand_rects(c: &RectCopy) {
+    let s = c.stride;
+    if !crate::gpu::shader::readable(c.src, 3 * s * c.rects) {
+        return;
+    }
+    let pos = c.elems.iter().find(|e| e.0 && rect_element(e.1).is_some_and(|(n, f)| f && n >= 8)).map(|e| e.3 as usize);
+    for r in 0..c.rects {
+        let v = |k: usize| c.src + (3 * r + k) * s;
+        let out = c.dst + 6 * r * s;
+        // the corner between the two short edges
+        let a = match pos {
+            Some(at) => {
+                let p = |k: usize| [((v(k) + at) as *const f32).read_unaligned(), ((v(k) + at + 4) as *const f32).read_unaligned()];
+                let d = |i: usize, j: usize| {
+                    let (x, y) = (p(i), p(j));
+                    (x[0] - y[0]).powi(2) + (x[1] - y[1]).powi(2)
+                };
+                let (e01, e12, e20) = (d(0, 1), d(1, 2), d(2, 0));
+                if e12 >= e01 && e12 >= e20 {
+                    0
+                } else if e20 >= e01 {
+                    1
+                } else {
+                    2
+                }
+            }
+            None => 0,
+        };
+        let (va, vb, vc) = (v(a), v((a + 1) % 3), v((a + 2) % 3));
+        std::ptr::copy_nonoverlapping((c.src + 3 * r * s) as *const u8, out as *mut u8, 3 * s);
+        std::ptr::copy_nonoverlapping(vc as *const u8, (out + 3 * s) as *mut u8, s);
+        std::ptr::copy_nonoverlapping(vb as *const u8, (out + 4 * s) as *mut u8, s);
+        // the fourth corner: starts as a copy of c (elements not listed stay c's)
+        let vd = out + 5 * s;
+        std::ptr::copy_nonoverlapping(vc as *const u8, vd as *mut u8, s);
+        for &(_, format, _, at) in &c.elems {
+            let Some((bytes, floats)) = rect_element(format) else { continue };
+            let at = at as usize;
+            if floats {
+                for k in (0..bytes).step_by(4) {
+                    let f = |p: usize| ((p + at + k) as *const f32).read_unaligned();
+                    ((vd + at + k) as *mut f32).write_unaligned(f(vb) + f(vc) - f(va));
+                }
+            } else {
+                for k in 0..bytes {
+                    let b = |p: usize| *((p + at + k) as *const u8) as i32;
+                    *((vd + at + k) as *mut u8) = (b(vb) + b(vc) - b(va)).clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// A draw of the console's rect list topology (three corners a rect; GTA VI clears, fades and
+/// composes its UI onto the back buffer with one rect): drawn from a triangle list of six
+/// vertices a rect, made of the title's vertices in an upload buffer now and again when the list
+/// is executed. False: not done (the caller draws the rects' first halves) – vertices in more
+/// than one slot, an element format not known here, memory the CPU cannot read.
+pub(super) unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
+    let mut state = None;
+    with_bindings(this, |b| {
+        if b.rect_list {
+            state = Some((b.vertex_titles.get(&0).copied(), b.vertex_buffers.get(&0).copied()));
+        }
+    });
+    let Some((Some((title, size, stride)), Some(bound))) = state else { return false };
+    let Some(elems) = real::pso_elements(pso) else { return false };
+    let (stride, rects) = (stride as usize, vertices as usize / 3);
+    let fits = elems.iter().all(|&(_, f, slot, at)| slot == 0 && at != u32::MAX && rect_element(f).is_some_and(|(n, _)| at as usize + n <= stride));
+    let src = title as usize + first_vertex as usize * stride;
+    if !fits || rects == 0 || rects > 0x1_0000 || stride == 0 || (first_vertex as usize + 3 * rects) * stride > size as usize || !crate::gpu::shader::readable(src, 3 * rects * stride) {
+        return false;
+    }
+    let Some((dst, gpu)) = cpu_chunk_take(this, 6 * rects * stride) else { return false };
+    let copy = RectCopy { src, stride, rects, dst, elems };
+    expand_rects(&copy);
+    if let Some(s) = LISTS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
+        s.rect_copies.push(copy);
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if once(&N, 1) {
+        crate::xlog_info!("D3D12.X: rect lists are drawn as two triangles a rect from a copy of their vertices ({rects} rect(s), stride {stride})");
+    }
+    list.IASetVertexBuffers(0, Some(&[D3D12_VERTEX_BUFFER_VIEW { BufferLocation: gpu, SizeInBytes: (6 * rects * stride) as u32, StrideInBytes: stride as u32 }]));
+    list.DrawInstanced(6 * rects as u32, instances, 0, first_instance);
+    list.IASetVertexBuffers(0, Some(&[bound]));
+    true
 }
 
 /// An index buffer view of ordinary process memory as one of its copy (`cpu_geometry`).
@@ -1959,6 +2086,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.clear_waits();
         s.cpu_writes.clear();
         s.cpu_copies.clear();
+        s.rect_copies.clear();
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
