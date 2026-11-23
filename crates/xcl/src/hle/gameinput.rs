@@ -299,6 +299,14 @@ fn merge_host_inputs(
     s.buttons |= read_scripted();
 }
 
+/// buttons the title has seen down so far
+static SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// Whether the title has seen any button down yet (traces that start with the first press).
+pub fn any_press() -> bool {
+    SEEN.load(Ordering::Relaxed) != 0
+}
+
 /// the gamepad now
 pub fn poll() -> GamepadState {
     let mut s = xinput_pad().unwrap_or_default();
@@ -314,7 +322,6 @@ pub fn poll() -> GamepadState {
     );
     {
         // the first presses of each button: worth a line (is input arriving at all?)
-        static SEEN: AtomicU32 = AtomicU32::new(0);
         let new = s.buttons & !SEEN.fetch_or(s.buttons, Ordering::Relaxed);
         if new != 0 {
             crate::xlog_info!("GameInput: gamepad buttons {new:#x} pressed for the first time");

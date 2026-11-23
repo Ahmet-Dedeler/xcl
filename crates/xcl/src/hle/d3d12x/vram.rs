@@ -49,6 +49,11 @@ pub(super) fn address(resource: usize) -> Option<usize> {
     PLACED_TEXTURES.lock().unwrap().as_ref()?.get(&resource).copied()
 }
 
+/// The placed textures whose title address is in `[lo, hi)` (resource, address) – the traces.
+pub(super) fn placed_in(lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    PLACED_TEXTURES.lock().unwrap().as_ref().map(|t| t.iter().filter(|(_, &a)| a >= lo && a < hi).map(|(&r, &a)| (r, a)).collect()).unwrap_or_default()
+}
+
 pub(super) fn forget(resource: usize) {
     if let Some(textures) = PLACED_TEXTURES.lock().unwrap().as_mut() {
         textures.remove(&resource);

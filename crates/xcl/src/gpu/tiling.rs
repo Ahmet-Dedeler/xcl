@@ -446,9 +446,95 @@ impl Chain {
         }
     }
 
+    /// Level `i` as plain rows in memory, if it lies there that way (a linear surface with no
+    /// swizzled base): (byte offset of its first row in the slice, bytes from a row to the
+    /// next, bytes of a row's elements, rows). What the CPU writes row by row with a pitch – a
+    /// video's planes – is copied without detiling (`detile_level`, and a title texture's
+    /// upload straight from the title's memory).
+    pub fn linear_rows(&self, i: usize) -> Option<(usize, usize, usize, usize)> {
+        let l = self.levels.get(i)?;
+        let lay = &self.layout;
+        if lay.mode != 0 || lay.base_xor != 0 || l.width == 0 || l.height == 0 {
+            return None;
+        }
+        let e = 1usize << lay.elem_log2;
+        let stride = l.pitch.div_ceil(lay.block_w) * lay.block_bytes;
+        Some((l.offset + l.origin.1 * stride + l.origin.0 * e, stride, l.width * e, l.height))
+    }
+
     /// level `i` of array slice `slice` (`src` = the slice's bytes) → linear rows of elements;
     /// bytes past the end of `src` read as 0
+    ///
+    /// An element's offset is its block's start plus the XOR of what x, y and z give within
+    /// the block (`Layout::offset_z`): the column parts are worked out once a level and the
+    /// row parts once a row, and a linear surface is copied a row at a time – textures the CPU
+    /// rewrites every frame (a video's planes) are detiled before each of the title's submits.
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
+        let l = self.levels[i];
+        let lay = &self.layout;
+        let e = 1usize << lay.elem_log2;
+        let mut out = vec![0u8; l.width * l.height * e];
+        if l.width == 0 || l.height == 0 {
+            return out;
+        }
+        let pitch_blocks = l.pitch.div_ceil(lay.block_w);
+        if let Some((first, stride, row_bytes, rows)) = self.linear_rows(i) {
+            // rows of whole 256-byte blocks, one after the other
+            for y in 0..rows {
+                if let Some(s) = src.get(first + y * stride..) {
+                    let n = row_bytes.min(s.len()) / e * e; // whole elements
+                    out[y * row_bytes..][..n].copy_from_slice(&s[..n]);
+                }
+            }
+            return out;
+        }
+        let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
+        // per column: the bytes of the blocks before it in the row, its XOR part
+        let cols: Vec<(usize, u32)> = (0..l.width)
+            .map(|x| {
+                let x = x + l.origin.0;
+                ((x / lay.block_w) * lay.block_bytes, lay.ox[x % lay.block_w] ^ hi(&lay.hx, x, lay.block_w))
+            })
+            .collect();
+        let zx = lay.oz[slice % lay.block_d] ^ hi(&lay.hz, slice, lay.block_d);
+        for (y, dst) in out.chunks_exact_mut(l.width * e).enumerate() {
+            let yy = y + l.origin.1;
+            let row = l.offset + (yy / lay.block_h) * pitch_blocks * lay.block_bytes;
+            let yx = lay.oy[yy % lay.block_h] ^ hi(&lay.hy, yy, lay.block_h) ^ zx;
+            let at = |b: usize, cx: u32| row + b + ((cx ^ yx) as usize ^ lay.base_xor);
+            match e {
+                1 => {
+                    for (d, &(b, cx)) in dst.iter_mut().zip(&cols) {
+                        if let Some(&v) = src.get(at(b, cx)) {
+                            *d = v;
+                        }
+                    }
+                }
+                4 => {
+                    for (d, &(b, cx)) in dst.chunks_exact_mut(4).zip(&cols) {
+                        let o = at(b, cx);
+                        if let Some(s) = src.get(o..o + 4) {
+                            d.copy_from_slice(s);
+                        }
+                    }
+                }
+                _ => {
+                    for (d, &(b, cx)) in dst.chunks_exact_mut(e).zip(&cols) {
+                        let o = at(b, cx);
+                        if let Some(s) = src.get(o..o + e) {
+                            d.copy_from_slice(s);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `detile_level` an element at a time through `element_at` (what the fast path is checked
+    /// against).
+    #[cfg(test)]
+    fn detile_level_by_element(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
@@ -492,6 +578,42 @@ mod tests {
     use super::*;
 
     const MODES: [u32; 14] = [1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 24, 25, 26, 27];
+
+    /// The row-wise `detile_level` gives what the element-wise one gives: every 2D mode and
+    /// linear, 1- to 16-byte elements, sizes that are no whole blocks, every level (the tail's
+    /// too), a second slice, a swizzled base and a source that ends early.
+    #[test]
+    fn detile_level_fast_path_matches_elements() {
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for cfg in configs() {
+            for mode in std::iter::once(0).chain(MODES) {
+                for e in 0..=4u32 {
+                    let Some(mut layout) = Layout::new(mode, e, cfg) else { continue };
+                    for (w, h, mips) in [(1u32, 1u32, 1u32), (67, 35, 1), (300, 130, 4), (256, 256, 9)] {
+                        if mode != 0 && w == 256 {
+                            layout.base_xor = 0x40 & (layout.block_bytes - 1);
+                        }
+                        let chain = Chain::new_3d(layout.clone(), w, h, 1, 1, mips);
+                        let mut mem: Vec<u8> = (0..chain.slice_bytes).map(|_| next() as u8).collect();
+                        if w == 300 {
+                            mem.truncate(mem.len() * 2 / 3);
+                        }
+                        for i in 0..chain.levels.len() {
+                            for slice in [0usize, 1] {
+                                assert!(chain.detile_level(&mem, i, slice) == chain.detile_level_by_element(&mem, i, slice), "mode {mode} element {e} {w}x{h} level {i} slice {slice}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn configs() -> Vec<PipeConfig> {
         let mut v = vec![];

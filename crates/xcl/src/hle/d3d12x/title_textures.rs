@@ -47,7 +47,20 @@ struct Entry {
     /// the title's GPU work wrote it (CopyTextureRegion into it): its CPU view is stale from
     /// then on and no longer uploaded
     gpu_written: bool,
+    /// the title's CPU wrote its memory and XCL was told (`note_cpu_write`): uploaded again
+    /// before the title's next submit, watched memory or not
+    cpu_written: bool,
 }
+
+/// textures with `cpu_written` set
+static CPU_WRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CPU_WRITE_UPLOADS: AtomicU64 = AtomicU64::new(0);
+/// microseconds and textures of those uploads: [as every upload, by rows]
+static CPU_WRITE_UPLOAD_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static CPU_WRITE_UPLOADS_BY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// of the uploads by rows: microseconds copying rows, and from the list's close to the GPU's end
+static ROWS_COPY_US: AtomicU64 = AtomicU64::new(0);
+static ROWS_GPU_US: AtomicU64 = AtomicU64::new(0);
 
 /// textures waiting for their first upload
 static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -83,12 +96,15 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
-    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false };
+    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false, cpu_written: false };
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(old) = t.insert(res as usize, e) {
             if old.pending {
                 PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
+            if old.cpu_written {
+                CPU_WRITTEN.fetch_sub(1, Ordering::Relaxed);
             }
         }
         TEXTURES_LEN.store(t.len(), Ordering::Relaxed);
@@ -122,6 +138,9 @@ pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
+    // (its staging buffer is let go outside the lock: that release comes back here)
+    let stage = STAGES.lock().unwrap().remove(&res);
+    drop(stage);
     let removed = {
         let mut t = TEXTURES.lock().unwrap();
         let r = t.remove(&res);
@@ -132,8 +151,111 @@ pub fn forget(res: usize) {
         if e.pending {
             PENDING.fetch_sub(1, Ordering::Relaxed);
         }
+        if e.cpu_written {
+            CPU_WRITTEN.fetch_sub(1, Ordering::Relaxed);
+        }
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
+}
+
+/// The title's CPU wrote `[va, va + len)` of its memory in a way XCL knows of (a video decoder
+/// of its own filled the frame buffers it was given, `hle::bink`): the textures kept in step
+/// that lie over it are uploaded again before the title's next submit. Memory that is not
+/// write-watched (a native host's graphics memory, `kernelx::graphics_protect`) has no other
+/// way to say so; for watched memory this is the same upload the watch would start. Returns
+/// how many textures lie there.
+pub fn note_cpu_write(va: usize, len: usize) -> usize {
+    // the memory itself, and where a page pool's GPU view shows it: a title with such a pool
+    // places its textures at the GPU view's addresses and writes them through the CPU's
+    let mut ranges = vec![(va, len)];
+    ranges.extend(super::gpu_views::views_of(va, len));
+    let mut t = TEXTURES.lock().unwrap();
+    let mut n = 0;
+    for e in t.values_mut().filter(|e| ranges.iter().any(|&(va, len)| e.va < va + len && va < e.va + e.tex.size() as usize)) {
+        n += 1;
+        if !e.cpu_written {
+            e.cpu_written = true;
+            CPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    n
+}
+
+/// Uploads done because the title's CPU writes were noted (`note_cpu_write`).
+pub fn cpu_write_uploads() -> u64 {
+    CPU_WRITE_UPLOADS.load(Ordering::Relaxed)
+}
+
+/// What those uploads took, as text: textures and milliseconds for the ones done as every
+/// upload and for the ones done by rows (of which copying rows / the GPU's part).
+pub fn cpu_write_upload_times() -> String {
+    let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    format!(
+        "{} as every upload in {} ms, {} by rows in {} ms (rows copied in {} ms, list run and waited for in {} ms)",
+        l(&CPU_WRITE_UPLOADS_BY[0]),
+        l(&CPU_WRITE_UPLOAD_US[0]) / 1000,
+        l(&CPU_WRITE_UPLOADS_BY[1]),
+        l(&CPU_WRITE_UPLOAD_US[1]) / 1000,
+        l(&ROWS_COPY_US) / 1000,
+        l(&ROWS_GPU_US) / 1000
+    )
+}
+
+/// `XCL_TRACE_VIDEO`: what `[va, va + len)` of the title's memory is here – its unified-memory
+/// window, what Windows says of its first page, whether writes to it are watched, and the
+/// resources the title placed there.
+pub unsafe fn describe_memory(va: usize, len: usize) -> String {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+    let mut out: Vec<String> = Vec::new();
+    match crate::gpu::uma::get() {
+        Some(u) => match u.window_of(va) {
+            Some(k) => out.push(format!("unified memory window {k} ({}{})", if u.is_sparse(va) { "sparse" } else { "committed" }, if u.is_title_address(va) { ", the title's" } else { ", not handed out" })),
+            None => out.push("outside unified memory".into()),
+        },
+        None => out.push("no unified memory".into()),
+    }
+    if crate::hle::kernelx::in_graphics_reservation(va) {
+        out.push("in a graphics reservation".into());
+    }
+    match (super::gpu_views::memory_at(va), super::gpu_views::views_of(va, len)) {
+        (Some(at), _) => out.push(format!("a page pool's GPU view of the memory at {at:#x}")),
+        (None, views) if !views.is_empty() => out.push(format!("shown in a page pool's GPU view at {:x?}{}", &views[..views.len().min(3)], if views.len() > 3 { format!(" … ({} ranges)", views.len()) } else { String::new() })),
+        _ => out.push(format!("in no page pool's GPU view ({} pages mapped in GPU views, physical page here: {:x?})", super::gpu_views::counts().0, crate::hle::kernelx::page_at(va))),
+    }
+    let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    if VirtualQuery(va as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0 {
+        out.push(format!("allocation {:#x}, region {:#x}+{:#x}, state {:#x}, protect {:#x}, type {:#x}", mbi.AllocationBase as usize, mbi.BaseAddress as usize, mbi.RegionSize, mbi.State, mbi.Protect, mbi.Type));
+    }
+    // (no reset: the look before the next submit still sees these writes)
+    let mut buf = [std::ptr::null_mut::<c_void>(); 64];
+    let (mut n, mut grain) = (buf.len(), 0u32);
+    let r = GetWriteWatch(0, (va & !0xFFF) as *const c_void, (len + 0xFFF) & !0xFFF, buf.as_mut_ptr(), &mut n, &mut grain);
+    out.push(if r == 0 { format!("write-watched ({n}{} pages written)", if n == buf.len() { "+" } else { "" }) } else { "not write-watched".into() });
+    let desc = |r: usize| {
+        let p = r as *mut c_void;
+        ID3D12Resource::from_raw_borrowed(&p).map(|x| x.GetDesc()).map(|d| format!("{}x{} format {} mips {} flags {:#x}", d.Width, d.Height, d.Format.0, d.MipLevels, d.Flags.0)).unwrap_or_default()
+    };
+    {
+        let t = TEXTURES.lock().unwrap();
+        let over: Vec<String> = t
+            .iter()
+            .filter(|(_, e)| e.va < va + len && va < e.va + e.tex.size() as usize)
+            .take(4)
+            .map(|(&r, e)| format!("{r:#x} at {:#x}+{:#x} ({}{}{})", e.va, e.tex.size(), desc(r), if e.pending { ", upload pending" } else { "" }, if e.gpu_written { ", GPU-written" } else { "" }))
+            .collect();
+        out.push(if over.is_empty() { "no title texture kept in step".into() } else { format!("title texture(s) kept in step: {}", over.join(", ")) });
+    }
+    let near = |list: Vec<(usize, usize)>| list.into_iter().take(4).map(|(r, a)| format!("{r:#x} at {a:#x} ({})", desc(r))).collect::<Vec<_>>().join(", ");
+    let (lo, hi) = (va.saturating_sub(64 << 20), va + len);
+    let placed = super::vram::placed_in(lo, hi);
+    if !placed.is_empty() {
+        out.push(format!("video-memory texture(s) placed from 64 MiB below: {}", near(placed)));
+    }
+    let own = super::real::title_addresses_in(va.saturating_sub(0x1_0000), hi);
+    if !own.is_empty() {
+        out.push(format!("resource(s) of their own at title addresses from 64 KiB below: {}", near(own)));
+    }
+    out.join("; ")
 }
 
 /// The title-memory address of a texture kept in step with it.
@@ -270,17 +392,18 @@ unsafe fn refresh_once(queue: *mut c_void) {
             super::sparse::before_execute(q, &dirty, page as usize);
         });
     }
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && CPU_WRITTEN.load(Ordering::Relaxed) == 0 {
         return;
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
+    let mut written: Vec<(ID3D12Resource, Upload)> = Vec::new();
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
         t.iter_mut()
             .filter(|(_, e)| {
-                if e.pending {
+                if e.cpu_written || e.pending {
                     return true;
                 }
                 if e.gpu_written {
@@ -294,12 +417,297 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
+                let noted = e.cpu_written;
+                if noted {
+                    e.cpu_written = false;
+                    CPU_WRITTEN.fetch_sub(1, Ordering::Relaxed);
+                    CPU_WRITE_UPLOADS.fetch_add(1, Ordering::Relaxed);
+                }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.state)))
+                let item = ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.state)))?;
+                if noted {
+                    written.push(item);
+                    return None;
+                }
+                Some(item)
             })
             .collect()
     });
+    if !written.is_empty() {
+        // textures the title rewrites frame after frame: row by row from its memory where they
+        // lie that way, the rest as every other upload
+        static TURN: AtomicU64 = AtomicU64::new(0);
+        let by_rows = match row_uploads() {
+            RowUploads::On => true,
+            RowUploads::Off => false,
+            RowUploads::Alternate => TURN.fetch_add(1, Ordering::Relaxed) % 2 == 0,
+        };
+        let t0 = std::time::Instant::now();
+        let n = written.len() as u64;
+        let rest = if by_rows { own_work(|| upload_rows(written)) } else { written };
+        let by_rows = by_rows && rest.is_empty();
+        upload_all(rest);
+        let k = by_rows as usize;
+        CPU_WRITE_UPLOAD_US[k].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        CPU_WRITE_UPLOADS_BY[k].fetch_add(n, Ordering::Relaxed);
+    }
     upload_all(todo);
+}
+
+/// `XCL_TITLE_ROW_UPLOADS=0`: textures the title's CPU rewrites are uploaded as every other
+/// texture (read, detiled, staged in a buffer made for the upload); `=ab`: every other time, to
+/// compare the two ways in one run (`cpu_write_uploads`).
+#[derive(Clone, Copy, PartialEq)]
+enum RowUploads {
+    On,
+    Off,
+    Alternate,
+}
+
+fn row_uploads() -> RowUploads {
+    static MODE: std::sync::OnceLock<RowUploads> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("XCL_TITLE_ROW_UPLOADS").as_deref().map(str::trim) {
+        Ok("0") => RowUploads::Off,
+        Ok("ab") => RowUploads::Alternate,
+        _ => RowUploads::On,
+    })
+}
+
+/// The staging buffer of a texture that is uploaded row by row (`upload_rows`): kept for the
+/// texture, mapped for good.
+struct Stage {
+    buffer: ID3D12Resource,
+    mapped: usize,
+    fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+}
+
+// (COM pointers of XCL's own objects, used under the map's lock)
+unsafe impl Send for Stage {}
+
+/// PC texture → its staging buffer
+static STAGES: Mutex<BTreeMap<usize, Stage>> = Mutex::new(BTreeMap::new());
+
+/// What `upload_rows` records with, per device: reused, as each upload waits for the GPU.
+struct Recorder {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+unsafe impl Send for Recorder {}
+
+static RECORDERS: Mutex<BTreeMap<usize, Recorder>> = Mutex::new(BTreeMap::new());
+
+/// The rows of a texture that is a single linear level (no mips, no array, no volume): (offset
+/// of the first row from the texture's address, bytes from a row to the next, bytes of a row,
+/// rows).
+fn single_level_rows(tex: &xg::Texture) -> Option<(usize, usize, usize, usize)> {
+    let s = tex.texels()?;
+    if s.depth > 0 || s.array != 1 || s.chain.levels.len() != 1 {
+        return None;
+    }
+    s.chain.linear_rows(0)
+}
+
+/// Bytes of the title's memory for an upload: where the CPU has the page a GPU view shows at
+/// their address (`gpu_views`), else at the address itself where that is readable. What was
+/// last found is kept – a row is a fraction of a page, and asking Windows about an address in
+/// a reservation of gigabytes is slow under Wine (it measures the whole region: a row at a
+/// time, a 4K frame's planes took 47 ms that way).
+struct TitleMemory {
+    /// the 64 KiB page last asked for and where its view is read (0: it is in no view, or the
+    /// page shown there cannot be read)
+    view: (usize, usize, bool),
+    /// the region Windows last described for an address itself: [start, end), readable
+    direct: (usize, usize, bool),
+    /// the same for the place of a view's page
+    source: (usize, usize, bool),
+}
+
+impl TitleMemory {
+    const PAGE: usize = crate::hle::kernelx::PHYS_PAGE_SIZE;
+
+    fn new() -> TitleMemory {
+        TitleMemory { view: (usize::MAX, 0, false), direct: (0, 0, false), source: (0, 0, false) }
+    }
+
+    /// The region around `a` (kept in `cache`): its end and whether it can be read.
+    unsafe fn region(cache: &mut (usize, usize, bool), a: usize) -> (usize, bool) {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+        if a < cache.0 || a >= cache.1 {
+            let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            *cache = if VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 {
+                (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize, m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0)
+            } else {
+                (a & !0xFFF, (a & !0xFFF) + 0x1000, false)
+            };
+        }
+        (cache.1, cache.2)
+    }
+
+    /// Where the byte at `at` is read (0: nowhere) and how many bytes from it are in the same
+    /// place (at least 1).
+    unsafe fn locate(&mut self, at: usize) -> (usize, usize) {
+        let page = at & !(Self::PAGE - 1);
+        if self.view.0 != page {
+            let src = super::gpu_views::memory_at(page);
+            // (a view's page is whole: 64 KiB the title mapped at once)
+            let readable = src.is_some_and(|s| {
+                let (end, ok) = Self::region(&mut self.source, s);
+                ok && end >= s + Self::PAGE
+            });
+            self.view = (page, if readable { src.unwrap_or(0) } else { 0 }, src.is_some());
+        }
+        if self.view.2 {
+            return (if self.view.1 != 0 { self.view.1 + (at - page) } else { 0 }, page + Self::PAGE - at);
+        }
+        let (end, ok) = Self::region(&mut self.direct, at);
+        (if ok { at } else { 0 }, end.min(page + Self::PAGE).max(at + 1) - at)
+    }
+
+    /// `n` bytes at `at` to `dst`; what is nowhere stays as `dst` has it. Returns whether all
+    /// of it was read.
+    unsafe fn read(&mut self, mut at: usize, mut dst: *mut u8, mut n: usize) -> bool {
+        let mut all = true;
+        while n > 0 {
+            let (src, same) = self.locate(at);
+            let chunk = n.min(same);
+            match src {
+                0 => all = false,
+                src => std::ptr::copy_nonoverlapping(src as *const u8, dst, chunk),
+            }
+            at += chunk;
+            dst = dst.add(chunk);
+            n -= chunk;
+        }
+        all
+    }
+}
+
+/// Uploads of textures that are one linear level, their rows copied straight from the title's
+/// memory into a staging buffer kept for each (no detiled copy, no buffer made per upload: a
+/// video's three planes of a 4K frame are 12 MiB thirty times a second). One list a device,
+/// then the wait for the GPU as for every upload. Returns the uploads that cannot go this way.
+unsafe fn upload_rows(todo: Vec<(ID3D12Resource, Upload)>) -> Vec<(ID3D12Resource, Upload)> {
+    let mut rest = Vec::new();
+    let mut memory = TitleMemory::new();
+    // the textures recorded: a reference each until the lists have run, and let go only after
+    // the locks here are (a last reference's release comes back to `forget`)
+    let mut kept: Vec<ID3D12Resource> = Vec::new();
+    // the device whose list is being recorded
+    let mut open: Option<usize> = None;
+    let mut stages = STAGES.lock().unwrap();
+    let mut recorders = RECORDERS.lock().unwrap();
+    let flush = |open: &mut Option<usize>, recorders: &mut BTreeMap<usize, Recorder>| {
+        let Some(device) = open.take() else { return };
+        let Some(r) = recorders.get_mut(&device) else { return };
+        let d = device as *mut c_void;
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return };
+        let t0 = std::time::Instant::now();
+        let mut run = || -> Result<(), String> {
+            r.list.Close().map_err(|e| e.to_string())?;
+            let queue = upload_queue(dev, device)?;
+            queue.ExecuteCommandLists(&[Some(r.list.cast().map_err(|e: windows::core::Error| e.to_string())?)]);
+            r.value += 1;
+            queue.Signal(&r.fence, r.value).map_err(|e| e.to_string())?;
+            crate::gpu::fence::wait(&r.fence, r.value, dev, None, 10_000).map_err(|e| e.to_string())
+        };
+        if let Err(e) = run() {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("title texture: upload by rows failed: {e}");
+            }
+        }
+        ROWS_GPU_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    };
+    for (res, (device, va, tex, state)) in todo {
+        let key = res.as_raw() as usize;
+        let d = device as *mut c_void;
+        let (Some(rows), Some(dev)) = (single_level_rows(&tex), ID3D12Device::from_raw_borrowed(&d)) else {
+            rest.push((res, (device, va, tex, state)));
+            continue;
+        };
+        let (first, stride, row_bytes, count) = rows;
+        // its staging buffer (made at its first upload this way)
+        if !stages.contains_key(&key) {
+            let rd = res.GetDesc();
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let (mut n, mut bytes, mut total) = (0u32, 0u64, 0u64);
+            dev.GetCopyableFootprints(&rd, 0, 1, 0, Some(&mut fp), Some(&mut n), Some(&mut bytes), Some(&mut total));
+            let made = if rd.MipLevels != 1 || rd.DepthOrArraySize != 1 || n as usize != count || bytes as usize != row_bytes || total == 0 || total == u64::MAX {
+                None
+            } else {
+                texture::buffer(dev, total).ok().and_then(|buffer| {
+                    let mut p = std::ptr::null_mut();
+                    buffer.Map(0, None, Some(&mut p)).ok()?;
+                    (!p.is_null()).then(|| Stage { buffer, mapped: p as usize, fp })
+                })
+            };
+            match made {
+                Some(stage) => {
+                    stages.insert(key, stage);
+                }
+                None => {
+                    rest.push((res, (device, va, tex, state)));
+                    continue;
+                }
+            }
+        }
+        let stage = &stages[&key];
+        // the list of this device (another device's is run first)
+        if open.is_some_and(|o| o != device) {
+            flush(&mut open, &mut recorders);
+        }
+        if open.is_none() {
+            let ready = match recorders.get(&device) {
+                Some(r) => r.alloc.Reset().is_ok() && r.list.Reset(&r.alloc, None).is_ok(),
+                None => {
+                    let made = || -> Result<Recorder, windows::core::Error> {
+                        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+                        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                        Ok(Recorder { alloc, list, fence, value: 0 })
+                    };
+                    match made() {
+                        Ok(r) => {
+                            recorders.insert(device, r);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+            };
+            if !ready {
+                rest.push((res, (device, va, tex, state)));
+                continue;
+            }
+            open = Some(device);
+        }
+        let pitch = stage.fp.Footprint.RowPitch as usize;
+        let t0 = std::time::Instant::now();
+        for y in 0..count {
+            memory.read(va + first + y * stride, (stage.mapped + stage.fp.Offset as usize + y * pitch) as *mut u8, row_bytes.min(pitch));
+        }
+        ROWS_COPY_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let list = &recorders[&device].list;
+        if state != D3D12_RESOURCE_STATE_COPY_DEST {
+            list.ResourceBarrier(&[texture::transition(&res, state, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        }
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&stage.buffer), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: stage.fp } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        if state != D3D12_RESOURCE_STATE_COPY_DEST {
+            list.ResourceBarrier(&[texture::transition(&res, D3D12_RESOURCE_STATE_COPY_DEST, state)]);
+        }
+        UPLOADS.fetch_add(1, Ordering::Relaxed);
+        kept.push(res);
+    }
+    flush(&mut open, &mut recorders);
+    drop(recorders);
+    drop(stages);
+    drop(kept);
+    rest
 }
 
 /// staging bytes of one batch at most
