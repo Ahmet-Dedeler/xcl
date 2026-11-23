@@ -15,6 +15,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 };
 
 use crate::hooks;
+use crate::isa;
 use crate::modules;
 
 pub fn register_function_table(base: usize, rva: u32, size: u32) -> bool {
@@ -142,6 +143,9 @@ pub fn install_crash_handler() {
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(null_call_logger));
+        if std::env::var_os("XCL_ISA_REDIRECT").is_some_and(|v| v == "0") {
+            REDIRECT.store(false, Ordering::Relaxed);
+        }
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(unsupported_insn_handler));
         if std::env::var_os("XCL_TRACE_EXCEPTIONS").is_some() {
             windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(first_chance_logger));
@@ -203,9 +207,208 @@ unsafe fn modrm_len(p: *const u8) -> Option<usize> {
     Some(n)
 }
 
-/// Zen 2 instructions a host CPU or translator does not run (Rosetta 2: CLWB, CLZERO), raised
-/// as illegal instructions. CLWB only hints the cache: the site is patched to NOPs, so it
-/// traps once. CLZERO zeroes the 64-byte line at RAX: done here on every trap.
+/// `CONTEXT` as the register file of `isa::exec`.
+struct Regs(*mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT);
+
+impl Regs {
+    /// Rax..R15 lie in the record in the hardware's register order.
+    unsafe fn gpr_at(&self, i: u8) -> *mut u64 {
+        std::ptr::addr_of_mut!((*self.0).Rax).add(i as usize & 15)
+    }
+}
+
+impl isa::Cpu for Regs {
+    fn gpr(&self, i: u8) -> u64 {
+        unsafe { *self.gpr_at(i) }
+    }
+    fn set_gpr(&mut self, i: u8, v: u64) {
+        unsafe { *self.gpr_at(i) = v }
+    }
+    fn rip(&self) -> u64 {
+        unsafe { (*self.0).Rip }
+    }
+    fn set_rip(&mut self, v: u64) {
+        unsafe { (*self.0).Rip = v }
+    }
+    fn flags(&self) -> u32 {
+        unsafe { (*self.0).EFlags }
+    }
+    fn set_flags(&mut self, v: u32) {
+        unsafe { (*self.0).EFlags = v }
+    }
+    fn xmm(&self, i: u8) -> (u64, u64) {
+        let x = unsafe { (*self.0).Anonymous.FltSave.XmmRegisters[i as usize & 15] };
+        (x.Low, x.High as u64)
+    }
+    fn set_xmm(&mut self, i: u8, v: (u64, u64)) {
+        let x = unsafe { &mut (*self.0).Anonymous.FltSave.XmmRegisters[i as usize & 15] };
+        (x.Low, x.High) = (v.0, v.1 as i64);
+    }
+    fn random(&mut self) -> Option<u64> {
+        #[link(name = "advapi32")]
+        extern "system" {
+            /// RtlGenRandom
+            fn SystemFunction036(buffer: *mut c_void, len: u32) -> u8;
+        }
+        let mut v = 0u64;
+        (unsafe { SystemFunction036(&mut v as *mut u64 as *mut c_void, 8) } != 0).then_some(v)
+    }
+}
+
+/// Up to 16 code bytes at `ip`, not reading into a following page that is not mapped.
+unsafe fn insn_bytes(ip: usize, buf: &mut [u8; 16]) -> &[u8] {
+    let in_page = 0x1000 - (ip & 0xFFF);
+    let n = if in_page >= 16 || crate::gpu::shader::readable(ip + in_page, 1) { 16 } else { in_page };
+    std::ptr::copy_nonoverlapping(ip as *const u8, buf.as_mut_ptr(), n);
+    &buf[..n]
+}
+
+/// Helpers that faulting sites are redirected to (`isa::thunk`): 64 KiB within reach of a
+/// `call rel32`, allocated at the first use. The first half holds the ADX helpers, one slot
+/// per operand combination, the second half one helper per INSERTQ/CLZERO site.
+/// 0: not allocated yet, 1: no room near the code – every use is then emulated.
+static HELPERS: AtomicUsize = AtomicUsize::new(0);
+static HELPERS_USED: AtomicUsize = AtomicUsize::new(isa::ADX_SLOT * isa::ADX_SLOTS);
+const HELPERS_SIZE: usize = 0x1_0000;
+/// Serialises site patching; `XCL_ISA_REDIRECT=0` turns it off (every use then traps).
+static PATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REDIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Free address space for the helpers: the nearest 64 KiB above `near`, else below.
+unsafe fn alloc_near(near: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+    const REACH: usize = 0x7000_0000;
+    let query = |at: usize| -> Option<(usize, usize, bool)> {
+        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        (VirtualQuery(at as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0)
+            .then(|| (mbi.BaseAddress as usize, (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize), mbi.State == MEM_FREE))
+    };
+    let take = |p: usize| VirtualAlloc(p as *const _, HELPERS_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
+    let mut at = near & !0xFFFF;
+    for _ in 0..4096 {
+        let Some((_, end, free)) = query(at) else { break };
+        if at - (near & !0xFFFF) > REACH {
+            break;
+        }
+        if free && at + HELPERS_SIZE <= end {
+            let p = take(at);
+            if p != 0 {
+                return p;
+            }
+        }
+        let next = end.saturating_add(0xFFFF) & !0xFFFF;
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    let mut at = near & !0xFFFF;
+    for _ in 0..4096 {
+        if at <= 0x2_0000 || (near & !0xFFFF) - at > REACH {
+            break;
+        }
+        let Some((base, _, free)) = query(at - 1) else { break };
+        let p = at - HELPERS_SIZE;
+        if free && p >= base {
+            let p = take(p);
+            if p != 0 {
+                return p;
+            }
+        }
+        let next = base & !0xFFFF;
+        if next >= at {
+            break;
+        }
+        at = next;
+    }
+    0
+}
+
+/// Writes `call helper` over the site at `site` (whose bytes were `code` when it trapped).
+/// `true`: the site is to be run again – redirected now, or changed by another thread.
+unsafe fn redirect(site: usize, code: &[u8], t: &isa::Thunk, helper: &[u8; isa::THUNK_MAX]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let n = t.site_len as usize;
+    let Some(code) = code.get(..n) else { return false };
+    if !REDIRECT.load(Ordering::Relaxed) || !(5..=8).contains(&n) {
+        return false;
+    }
+    while PATCHING.swap(true, Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+    let done = (|| {
+        if std::slice::from_raw_parts(site as *const u8, n) != code {
+            return true;
+        }
+        let mut pool = HELPERS.load(Ordering::Relaxed);
+        if pool == 0 {
+            pool = alloc_near(site).max(1);
+            HELPERS.store(pool, Ordering::Relaxed);
+        }
+        let used = HELPERS_USED.load(Ordering::Relaxed);
+        let at = match t.slot {
+            _ if pool == 1 => return false,
+            Some(s) => pool + (s as usize % isa::ADX_SLOTS) * isa::ADX_SLOT,
+            None if used + isa::THUNK_MAX <= HELPERS_SIZE => pool + used,
+            None => return false,
+        };
+        let Some(call) = isa::call_site(site as u64, t.site_len, at as u64) else { return false };
+        // eight bytes in one store where the page allows it: no thread runs half a call
+        let span = if site & 0xFFF <= 0xFF8 { 8 } else { n };
+        let mut old = 0u32;
+        if VirtualProtect(site as *const _, span, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        // fresh memory is zero and no helper starts with a zero byte: an ADX slot is written once
+        if *(at as *const u8) == 0 {
+            std::ptr::copy_nonoverlapping(helper.as_ptr(), at as *mut u8, (t.len as usize).min(isa::THUNK_MAX));
+            FlushInstructionCache(GetCurrentProcess(), at as *const _, isa::THUNK_MAX);
+            if t.slot.is_none() {
+                HELPERS_USED.store(used + isa::THUNK_MAX, Ordering::Relaxed);
+            }
+        }
+        if span == 8 {
+            let mut b = (site as *const [u8; 8]).read_unaligned();
+            for (d, s) in b.iter_mut().zip(call).take(n) {
+                *d = s;
+            }
+            (site as *mut u64).write_unaligned(u64::from_le_bytes(b));
+        } else {
+            std::ptr::copy_nonoverlapping(call.as_ptr(), site as *mut u8, n);
+        }
+        VirtualProtect(site as *const _, span, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), site as *const _, n);
+        true
+    })();
+    PATCHING.store(false, Ordering::Release);
+    done
+}
+
+/// One log line per instruction kind, and one when emulation by exception turns out to be
+/// frequent: each such trap costs tens of microseconds.
+unsafe fn note_insn(kind: usize, what: &str, redirected: bool, ip: usize) {
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    static EMULATED: AtomicUsize = AtomicUsize::new(0);
+    if SEEN.fetch_or(1 << kind, Ordering::Relaxed) & (1 << kind) == 0 {
+        let how = if redirected { "each site calls a helper after its first use" } else { "emulated at each use" };
+        crate::xlog_warn!("CPU: {what} is not available on this host – {how} (first at {})", modules::describe_address(ip));
+    }
+    if !redirected {
+        let n = EMULATED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 10_000 || n == 1_000_000 {
+            crate::xlog_warn!("CPU: {n} instructions emulated by exception so far (now {what} at {}) – this is slow", modules::describe_address(ip));
+        }
+    }
+}
+
+/// Zen 2 instructions a host CPU or translator does not run (Rosetta 2: ADX, RDSEED, SSE4a,
+/// CLWB, CLZERO, MONITORX/MWAITX), raised as illegal instructions. A site of five bytes or more is redirected
+/// to a helper in host code (ADCX/ADOX, INSERTQ, CLZERO in the zeroing loops), so it traps
+/// once; the others are emulated on the context at every use (`isa`). CLWB only hints the
+/// cache: the site is patched to NOPs. A lone CLZERO zeroes the 64-byte line at RAX here;
+/// MONITORX/MWAITX become a yield.
 unsafe extern "system" fn unsupported_insn_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     static SITES: AtomicUsize = AtomicUsize::new(0);
     let rec = &*(*info).ExceptionRecord;
@@ -214,6 +417,47 @@ unsafe extern "system" fn unsupported_insn_handler(info: *mut EXCEPTION_POINTERS
         return 0;
     }
     let ip = ctx.Rip as *const u8;
+    let mut buf = [0u8; 16];
+    let code = insn_bytes(ip as usize, &mut buf);
+    // already a call to a helper: another thread redirected the site while this one was on
+    // its way here with the old instruction. Run it again.
+    if let (Some(0xE8), Some(rel)) = (code.first(), code.get(1..5)) {
+        let to = (ip as usize + 5).wrapping_add(i32::from_le_bytes([rel[0], rel[1], rel[2], rel[3]]) as usize);
+        let pool = HELPERS.load(Ordering::Relaxed);
+        if pool > 1 && (pool..pool + HELPERS_SIZE).contains(&to) {
+            return -1;
+        }
+    }
+    // likewise a CLWB site that became NOPs: a NOP does not raise this exception
+    if code.first() == Some(&0x90) {
+        return -1;
+    }
+    let mut helper = [0u8; isa::THUNK_MAX];
+    if let Some(t) = isa::thunk(code, &mut helper) {
+        // a site that takes a call is never emulated: with CLZERO the call also covers the
+        // next instruction, where an emulated thread would return to
+        if redirect(ip as usize, code, &t, &helper) {
+            note_insn(t.op as usize, t.op.name(), true, ip as usize);
+            return -1;
+        }
+    }
+    if let Some(insn) = isa::decode(code) {
+        if isa::exec(&insn, &mut Regs(ctx)) {
+            note_insn(8 + insn.op as usize, insn.op.name(), false, ip as usize);
+            return -1;
+        }
+    }
+    // MONITORX (0F 01 FA) arms a wait on the line at RAX, MWAITX (0F 01 FB) waits for a write
+    // to it, a timeout or any other event: returning at once is within its contract, and the
+    // title's one wait loop tests its condition again. The thread yields instead.
+    if code.starts_with(&[0x0F, 0x01, 0xFA]) || code.starts_with(&[0x0F, 0x01, 0xFB]) {
+        if code.get(2) == Some(&0xFB) {
+            windows_sys::Win32::System::Threading::SwitchToThread();
+        }
+        ctx.Rip += 3;
+        note_insn(15, "MONITORX/MWAITX", false, ip as usize);
+        return -1;
+    }
     // CLZERO: 0F 01 FC
     if *ip == 0x0F && *ip.add(1) == 0x01 && *ip.add(2) == 0xFC {
         std::ptr::write_bytes((ctx.Rax as usize & !63) as *mut u8, 0, 64);
