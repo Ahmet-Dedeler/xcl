@@ -69,6 +69,8 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         let now = std::time::Instant::now();
         if let Some(t) = LAST.lock().unwrap().replace(now) {
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
+            // what keeping title textures in step with the title's memory took in those frames
+            crate::xlog_info!("D3D12.X: title textures over the last 300 frames: {}", super::title_textures::cost_since_last());
             // where the pages of title textures in GPU views came from so far
             if let Some(v) = super::title_textures::view_sources() {
                 crate::xlog_info!("D3D12.X: title textures in GPU views, pages by source: {v}; {} page(s) mapped by the queue now", super::gpu_views::counts().0);
