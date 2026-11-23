@@ -147,6 +147,39 @@ pub fn install_crash_handler() {
             REDIRECT.store(false, Ordering::Relaxed);
         }
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(unsupported_insn_handler));
+        // `XCL_DUMP_THREADS_AT=40,90`: every thread's call stack that many seconds into the
+        // run – what a title that neither crashes nor moves on is waiting for
+        if let Ok(at) = std::env::var("XCL_DUMP_THREADS_AT") {
+            let mut times: Vec<u64> = at.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            times.sort_unstable();
+            let _ = std::thread::Builder::new().name("xcl-thread-dump".into()).spawn(move || {
+                let start = std::time::Instant::now();
+                for t in times {
+                    let due = std::time::Duration::from_secs(t);
+                    if let Some(wait) = due.checked_sub(start.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
+                    crate::xlog_info!("thread stacks {t} s into the run (XCL_DUMP_THREADS_AT):");
+                    dump_threads();
+                    // `XCL_PEEK=140a210d81:1,14a210d60:8`: title globals by their address in the
+                    // image as linked (hex) and size in bytes, read at the same moment
+                    if let (Ok(list), Some(m)) = (std::env::var("XCL_PEEK"), modules::main_module()) {
+                        for item in list.split(',') {
+                            let mut it = item.trim().split(':');
+                            let (Some(a), n) = (it.next().and_then(|a| u64::from_str_radix(a, 16).ok()), it.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(8)) else { continue };
+                            let at = m.base + (a as usize).wrapping_sub(0x1_4000_0000);
+                            if !m.contains(at) || !m.contains(at + n.min(8) - 1) {
+                                continue;
+                            }
+                            let mut v = 0u64;
+                            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, &mut v as *mut u64 as *mut u8, n.min(8)) };
+                            crate::xlog_info!("peek {a:#x} ({n} B) = {v:#x}");
+                        }
+                    }
+                    crate::log::flush();
+                }
+            });
+        }
         if std::env::var_os("XCL_TRACE_EXCEPTIONS").is_some() {
             windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(first_chance_logger));
         }

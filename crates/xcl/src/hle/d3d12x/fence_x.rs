@@ -47,12 +47,22 @@ unsafe fn borrowed<R>(fence: usize, f: impl FnOnce(&ID3D12Fence) -> R) -> Option
     ID3D12Fence::from_raw_borrowed(&p).map(f)
 }
 
+/// `XCL_TRACE_FENCES=1`: the first 200 fence events (address asked, queue signals, values)
+fn trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FENCES").is_some()) && N.fetch_add(1, Ordering::Relaxed) < 200
+}
+
 fn refresh() {
     let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
     for (&p, f) in g.iter().flatten() {
         if let Some(c) = f.cell {
             if let Some(v) = unsafe { borrowed(p, |f| f.GetCompletedValue()) } {
-                c.0.store(v, Ordering::Release);
+                let was = c.0.swap(v, Ordering::AcqRel);
+                if was != v && trace() {
+                    crate::xlog_info!("fence {p:#x}: completed value {was:#x} -> {v:#x} (cell {:p})", c.0.as_ptr());
+                }
             }
         }
     }
@@ -72,6 +82,9 @@ pub(super) unsafe fn note_queue_signal(fence: usize, value: u64) {
         f.signalled = f.signalled.max(value);
         f.cell.is_some()
     };
+    if trace() {
+        crate::xlog_info!("fence {fence:#x}: queue signal {value:#x} ({})", if cell { "cell armed" } else { "no cell asked for yet" });
+    }
     if cell {
         arm(fence, value);
     }
@@ -103,6 +116,9 @@ pub(super) unsafe extern "system" fn completed_value_address(this: *mut c_void) 
         arm(this as usize, pending);
     }
     refresh();
+    if trace() {
+        crate::xlog_info!("fence {:#x}: completed-value address asked (#12): cell {:p}, value {:#x}, queue signal pending {pending:#x}", this as usize, cell.0.as_ptr(), cell.0.load(Ordering::Acquire));
+    }
     cell.0.as_ptr()
 }
 

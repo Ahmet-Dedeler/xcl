@@ -704,7 +704,9 @@ fn frame_dump_due() -> bool {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    // the first frames too: a title under bring-up may never reach its 20th
+    let n = PRESENTS.load(Ordering::Relaxed);
+    every > 0 && (n < 4 || n % every == 20.min(every - 1))
 }
 
 /// Frames shown so far.
