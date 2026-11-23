@@ -1839,11 +1839,13 @@ Little is left to do without the exe – the rest needs an actual run of the gam
   (`title_textures::poll_unwatched`, a 64-bit hash of its memory, ~6 GB/s under Rosetta): one that changed in the
   last 16 frames before every submit, one that ever changed before the first submit of every frame, the others in
   turn (`pick`: 2 MiB a submit each for the textures the title mapped, those of the last 300 frames and the rest).
-  An Unmap of a title texture uploads it before the next submit. `Chain::detile_level` works a row at a time (a
+  An Unmap of such a texture has it compared before the next submit (no upload unless its bytes changed: a
+  target the GPU wrote is not written over with stale memory). `Chain::detile_level` works a row at a time (a
   linear level is copied). Seen live with an earlier form of the turns (one turn of 4 MiB, new textures compared
   for 30 frames): complete text on four pages, 28 - 30 fps, 815 textures / 970 MiB unwatched, 1.7 ms a submit; the
-  turns as they are now are covered by unit tests and a 246 s run that did not reach the front end (two other
-  copies of the game were running: the DXC memory gate held its compiles back).
+  turns as they are now are covered by unit tests (`pick`) and a 246 s run that did not reach the front end (two
+  other copies of the game were running: the DXC memory gate held its compiles back); the Unmap rule was built
+  after the last run.
 - Not covered: a texture that never changed and was never mapped is found late (up to ~160 frames in the front
   end, longer with more texture memory in the game) – streamed textures should be told by who writes them (DirectStorage,
   MapTitlePhysicalPages) instead; GPU-owned textures placed at addresses that are no multiple of 64 KiB fall out of

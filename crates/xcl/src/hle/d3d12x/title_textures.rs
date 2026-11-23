@@ -59,9 +59,11 @@ struct Entry {
     /// its content changed after the first upload (unwatched: a texture the CPU keeps writing
     /// – a glyph cache, a video plane – is looked at every frame from then on)
     dynamic: bool,
-    /// the title unmapped it since the last upload: what it wrote while it was mapped goes up
-    /// before its next submit. (No more than that: a retail game maps its glyph cache once,
-    /// unmaps it and writes through the pointer for the rest of the run.)
+    /// the title unmapped it since the last look (unwatched: it is compared before the next
+    /// submit – what was written while it was mapped goes up then; a texture the title only
+    /// read through the pointer, a target the GPU wrote, is the same as before and stays as it
+    /// is). No more than that: a retail game maps its glyph cache once, unmaps it and writes
+    /// through the pointer for the rest of the run.
     unmapped: bool,
     /// the title mapped it at least once: one it means to write (unwatched: these have a turn
     /// of their own until their content first changes)
@@ -146,20 +148,14 @@ pub fn note_gpu_write(res: usize) {
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
-/// textures unmapped since their last upload
-static UNMAPPED: AtomicU64 = AtomicU64::new(0);
-
 /// The title unmapped texture `res` (`Map` gave it the texture's place in its memory,
-/// `real::res_map`): what it wrote there is uploaded before its next submit, whether the memory
-/// is write-watched or not.
+/// `real::res_map`): one it means to write. In memory that is not write-watched it is compared
+/// before the next submit and has its turn among the mapped from now on (`pick`).
 pub fn note_unmap(res: usize) {
     let mut t = TEXTURES.lock().unwrap();
     let Some(e) = t.get_mut(&res) else { return };
     e.mapped = true;
-    if !e.unmapped {
-        e.unmapped = true;
-        UNMAPPED.fetch_add(1, Ordering::Relaxed);
-    }
+    e.unmapped = true;
     static N: AtomicU64 = AtomicU64::new(0);
     let k = N.fetch_add(1, Ordering::Relaxed);
     if trace_unwatched() && (k < 60 || k.is_power_of_two()) {
@@ -179,25 +175,6 @@ pub fn memory_summary(res: usize) -> String {
     format!(" [memory: {nonzero} of 65536 sampled bytes not zero, hash {:016x}, sent {sent:016x}, (unwatched, GPU-written, dynamic) {flags:?}]", unsafe { content_hash(va, size) })
 }
 
-/// The textures unmapped since their last upload (a reference each).
-unsafe fn take_unmapped() -> Vec<(ID3D12Resource, Upload)> {
-    if UNMAPPED.load(Ordering::Relaxed) == 0 {
-        return Vec::new();
-    }
-    let mut t = TEXTURES.lock().unwrap();
-    t.iter_mut()
-        .filter(|(_, e)| e.unmapped)
-        .filter_map(|(&res, e)| {
-            e.unmapped = false;
-            UNMAPPED.fetch_sub(1, Ordering::Relaxed);
-            if e.pending || e.gpu_written {
-                return None; // (pending: its first upload takes the memory as it is now)
-            }
-            let p = res as *mut c_void;
-            ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.state)))
-        })
-        .collect()
-}
 
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
@@ -354,9 +331,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
             super::sparse::before_execute(q, &dirty, page as usize);
         });
     }
-    // textures in memory that is not write-watched: by content; those the title unmapped
+    // textures in memory that is not write-watched: by content
     let mut todo = poll_unwatched();
-    todo.extend(take_unmapped());
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         upload_all(todo);
         return;
@@ -456,12 +432,14 @@ struct Seen {
     size: usize,
     dynamic: bool,
     mapped: bool,
+    /// unmapped since the last look
+    now: bool,
     changed: u64,
     made: u64,
 }
 
 /// The textures of `all` (ascending keys) to compare before this submit, as indices: those
-/// whose content changed in the last `HOT_FRAMES` frames; at a frame's first submit
+/// just unmapped or whose content changed in the last `HOT_FRAMES` frames; at a frame's first submit
 /// (`new_frame`) those that ever changed; and of each turn (`cursors`: the key each stopped at)
 /// the next `TURN_BYTES`, at least one texture.
 fn pick(all: &[Seen], frame: u64, new_frame: bool, cursors: &mut [usize; 3]) -> Vec<usize> {
@@ -478,8 +456,8 @@ fn pick(all: &[Seen], frame: u64, new_frame: bool, cursors: &mut [usize; 3]) -> 
             0
         };
         let hot = e.dynamic && frame.saturating_sub(e.changed) < HOT_FRAMES;
-        if hot || (e.dynamic && new_frame) {
-            if hot_bytes + e.size <= HOT_BYTES {
+        if e.now || hot || (e.dynamic && new_frame) {
+            if e.now || hot_bytes + e.size <= HOT_BYTES {
                 hot_bytes += e.size;
                 look.push(i);
             } else {
@@ -564,14 +542,15 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
     let new_frame = LAST_FRAME.swap(frame, Ordering::Relaxed) != frame;
     // (texture, address, bytes, hash last sent)
     let (look, count, total): (Vec<(usize, usize, usize, u64)>, usize, usize) = {
-        let t = TEXTURES.lock().unwrap();
+        let mut t = TEXTURES.lock().unwrap();
         let mut all: Vec<Seen> = Vec::new();
         let mut places: Vec<(usize, u64)> = Vec::new();
-        for (&res, e) in t.iter() {
+        for (&res, e) in t.iter_mut() {
+            let now = std::mem::take(&mut e.unmapped);
             if !e.unwatched || e.pending || e.gpu_written {
                 continue;
             }
-            all.push(Seen { key: res, size: e.tex.size() as usize, dynamic: e.dynamic, mapped: e.mapped, changed: e.changed, made: e.made });
+            all.push(Seen { key: res, size: e.tex.size() as usize, dynamic: e.dynamic, mapped: e.mapped, now, changed: e.changed, made: e.made });
             places.push((e.va, e.sent));
         }
         let picked = pick(&all, frame, new_frame, &mut CURSORS.lock().unwrap());
@@ -890,7 +869,7 @@ mod tests {
     use super::*;
 
     fn seen(key: usize, size: usize) -> Seen {
-        Seen { key, size, dynamic: false, mapped: false, changed: 0, made: 0 }
+        Seen { key, size, dynamic: false, mapped: false, now: false, changed: 0, made: 0 }
     }
 
     /// Textures that never changed are all looked at within about (their bytes / `TURN_BYTES`)
@@ -953,6 +932,9 @@ mod tests {
         assert!(!pick(&all, later, false, &mut cursors).contains(&300));
         // a changed texture is not in a turn as well
         assert_eq!(pick(&all, later, true, &mut cursors).iter().filter(|&&i| i == 300).count(), 1);
+        // one just unmapped: before this submit, whatever else waits, and once
+        all[77].now = true;
+        assert_eq!(pick(&all, later, false, &mut cursors).iter().filter(|&&i| i == 77).count(), 1);
     }
 
     /// More changed textures than `HOT_BYTES`: the rest are looked at in their turn.
