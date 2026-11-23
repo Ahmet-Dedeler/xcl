@@ -554,6 +554,15 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     if is_ext(v) {
         return;
     }
+    // a retail game's inline SetPipelineState copies pso+0x10 and pso+0x20 with aligned vector
+    // loads before it calls the method (exe+0x32786, +0x248c30d): a pipeline object that is
+    // not 16-byte aligned faults there
+    if kind == Kind::PipelineState && obj as usize & 0xF != 0 {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!("D3D12.X: the host's pipeline state objects are not 16-byte aligned ({:#x}) – console code that loads pso+0x10 with aligned moves will fault", obj as usize);
+        }
+    }
     let ext = class_for(obj, v, kind);
     *(obj as *mut usize) = ext;
 }
@@ -674,14 +683,23 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     }
     // methods the newer console layout keeps at other slots: picked at each call
     if kind == Kind::CommandList {
-        let older_handlers = console_slots(kind);
-        for (newer, older) in NEWER_LIST_SLOTS {
-            let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == older) else { continue };
-            if newer >= total {
+        let (older_handlers, remap) = (console_slots(kind), console_remap(kind));
+        // what an older-layout title gets at `slot`: XCL's console method or the moved PC one
+        let older_method = |slot: usize| older_handlers.iter().find(|e| e.0 == slot).map(|e| e.1).or_else(|| remap.iter().find(|e| e.0 == slot).map(|e| pc[HDR + e.1]));
+        let newer_only = newer_list_slots();
+        for newer in super::list_layout::FIRST_SHIFTED..total.min(super::list_layout::LAST_SHIFTED + 1) {
+            let f = if let Some(e) = newer_only.iter().find(|e| e.0 == newer) {
+                e.1
+            } else if let Some(f) = super::list_layout::older_slot(newer).and_then(older_method) {
+                f
+            } else if older_method(newer).is_some() {
+                // the older layout's method at this slot is another one here: logged, not run
+                stubs::make_stub_info(DLL, &format!("{}::#{newer} (newer layout, not modelled)", iface.name), 0).0
+            } else {
                 continue;
-            }
-            let pc = if newer < scanned { *ot.add(newer) } else { v[HDR + newer] };
-            v[HDR + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[HDR + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+            };
+            let own = if newer < scanned { *ot.add(newer) } else { v[HDR + newer] };
+            v[HDR + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[HDR + newer], newer: f, pc: own, newer_layout: &QUEUE_SHIFTED });
         }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
@@ -831,6 +849,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         Kind::Fence => vec![(12, super::fence_x::completed_value_address as usize)],
+        Kind::CommandAllocator => vec![(9, super::list_x::allocator_memory_callback_x as usize)],
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
@@ -901,13 +920,36 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
-                // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
-                (146, l::uav_barrier_x as usize),
+                // hardware state of the newer layout, called before the layout is known (a
+                // retail game's first list calls); no method is known here on the older one
+                (131, l::state_131_x as usize),
+                (132, l::state_132_x as usize),
+                // enhanced barriers (a retail game's state changes; `XboxBvhBuilder.dll`)
+                (146, l::barrier_x as usize),
+                // console compute/BVH builder extension (`XboxBvhBuilder.dll`)
                 (148, b::allocate_upload_memory as usize),
             ]
         }
         _ => vec![],
     }
+}
+
+/// Command list methods of the newer layout that are not the older layout's two slots before
+/// (slot, method): Wait{32,64}BitValueX without the mask argument, and console state with no
+/// PC equivalent, each a logged no-op (`list_x::state_noop`).
+fn newer_list_slots() -> Vec<(usize, usize)> {
+    use super::list_x as l;
+    vec![
+        (73, l::wait32_newer_x as usize),
+        (74, l::wait64_newer_x as usize),
+        (75, l::state_75_x as usize),
+        (101, l::state_101_x as usize),
+        (128, l::state_128_x as usize),
+        (129, l::state_129_x as usize),
+        (131, l::state_131_x as usize),
+        (132, l::state_132_x as usize),
+        (142, l::state_142_x as usize),
+    ]
 }
 
 /// descriptor heap #9 / #10 GetCPU / GetGPUDescriptorHandleForHeapStart: console code
@@ -4074,7 +4116,7 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 // the list stayed closed, the debug layer saw every call on it refused, and Close failed).
 
 /// the title's runtime has the newer layouts (queue: two methods before Signal; command list:
-/// console methods from CopyTextureRegionX on two slots later)
+/// console methods from #61 on two slots later)
 pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 
 /// the title's runtime has the older queue layout: it signalled / waited on a fence at #14 / #15
@@ -4109,7 +4151,12 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     const PC_CLOCK_CALIBRATION: usize = 17;
     const PC_GET_DESC: usize = 18;
     if (slot == 16 || slot == 17) && is_fence(a1) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
-        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
+        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: console methods from #61 two slots later – a fence passed to queue #{slot})");
+    }
+    // #35 with the title's lists is the newer layout's submission, and it can come before
+    // the first Signal (the older layout has no method known there)
+    if slot == 35 && !QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.load(Ordering::Acquire) && is_title_lists(a1, a2) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (its command lists passed to queue #35)");
     }
     let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
     if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
@@ -4247,6 +4294,73 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     });
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
+}
+
+/// Whether (`n`, `lists`) are a count and an array whose first entry is a command list console
+/// code got from XCL.
+unsafe fn is_title_lists(n: usize, lists: usize) -> bool {
+    if !(1..=0x1000).contains(&n) || !crate::gpu::shader::readable(lists, 8) {
+        return false;
+    }
+    let l = *(lists as *const *mut c_void);
+    super::title_list::backing(l).is_some() || super::console_list::pc_list(l).is_some()
+}
+
+/// command queue #35 of the newer layout: ExecuteCommandLists with two more arguments (count,
+/// lists, the frame token WaitFrameEventX gave, flags) – a retail game's only submission: its
+/// submit thread passes up to 256 lists with flags 3, and before a batch one of its per-queue
+/// state lists with flags 0. The lists are XCL's console-shaped objects; everything the
+/// title's inline D3D12.X code would have written into them went through methods onto the PC
+/// list behind each (`title_list`), so this is the PC's ExecuteCommandLists. The token and
+/// the flags are not modelled (frame pacing has its own methods). A list of another type
+/// than the queue is left out – the PC removes the device for it.
+unsafe fn q_execute_command_lists_x(this: *mut c_void, n: u32, lists: *const *mut c_void, token: u64, flags: u32) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+    if n == 0 || lists.is_null() || !crate::gpu::shader::readable(lists as usize, 8 * n as usize) {
+        return;
+    }
+    if CALLS.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_info!("D3D12.X: command queue #35 (count, lists, frame token, flags) submits as ExecuteCommandLists – first call: {n} list(s), token {token:#x}, flags {flags:#x}");
+    }
+    let queue_ty = super::list_x::queue_type(this as usize).map(|t| t.0);
+    let typed: Vec<(*mut c_void, Option<i32>)> = std::slice::from_raw_parts(lists, n as usize)
+        .iter()
+        .filter(|l| !l.is_null())
+        .map(|&l| {
+            let pc = super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l);
+            (l, is_adopted(pc).then(|| super::list_x::list_type(pc).0))
+        })
+        .collect();
+    let kept = super::list_layout::for_queue(queue_ty, &typed);
+    if kept.len() != n as usize && DROPPED.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: command queue #35: {} of {n} list(s) left out (null, or not of the queue's type {queue_ty:?}: {:?})", n as usize - kept.len(), typed.iter().map(|e| e.1).collect::<Vec<_>>());
+    }
+    if !kept.is_empty() {
+        q_execute_command_lists(this, kept.len() as u32, kept.as_ptr());
+    }
+}
+
+/// command queue #31 of the newer layout (batch count, batches, page pool address, u32, 0): a
+/// retail game calls it on its page pool's copy queue right after
+/// XMemMapPhysicalPagesScatter, with what it just mapped – batches { address, range count,
+/// ranges } of ranges { 1 = mapped / 2 = unmapped, pool page, page count } (64 KiB pages):
+/// the GPU's page tables follow the CPU's. XCL has no GPU page table of its own for pool
+/// pages (RegisterPagePoolX only notes the pool), so there is nothing to update; the result
+/// is not checked. (This is where streamed texture pages change hands.)
+unsafe fn q_update_page_mappings_x(n: u32, batches: *const u8, pool: u64, arg: u32) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    let first = if n != 0 && crate::gpu::shader::readable(batches as usize, 0x18) {
+        let (va, ranges, p) = ((batches as *const u64).read_unaligned(), (batches.add(8) as *const u32).read_unaligned(), (batches.add(0x10) as *const usize).read_unaligned());
+        let range = if ranges != 0 && crate::gpu::shader::readable(p, 12) { (p as *const [u32; 3]).read_unaligned() } else { [0; 3] };
+        format!("first batch: address {va:#x}, {ranges} range(s), first {{ flags {}, pool page {:#x}, {} page(s) }}", range[0], range[1], range[2])
+    } else {
+        String::from("no readable batch")
+    };
+    crate::xlog_info!("D3D12.X: command queue #31 (page mappings of pool {pool:#x}: {n} batch(es), {arg:#x}) – XCL keeps no GPU page table for pool pages; not done ({first})");
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
