@@ -1825,7 +1825,14 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
         return super::console_heap::write(&slot, &[0; 8]);
     }
-    f(this, res, desc, slot.pc_srv);
+    match desc.as_ref().filter(|_| !res.is_null()) {
+        Some(v) => {
+            let mut v = *v;
+            v.Format.0 = view_format_for(res, v.Format.0, false);
+            f(this, res, &v, slot.pc_srv);
+        }
+        None => f(this, res, desc, slot.pc_srv),
+    }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
@@ -2156,6 +2163,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateDescriptorHeap", dev_create_descriptor_heap as usize),
             ("CreateRootSignature", dev_create_root_signature as usize),
             ("CreateRenderTargetView", dev_create_rtv as usize),
+            ("CreateDepthStencilView", dev_create_dsv as usize),
             ("CreateCommittedResource", dev_create_committed_resource as usize),
             ("CreateHeap", dev_create_heap as usize),
             ("CreatePlacedResource", dev_create_placed_resource as usize),
@@ -4057,6 +4065,40 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 // ---------------------------------------------------------------------------------------
 // presentation tracking
 // ---------------------------------------------------------------------------------------
+
+/// The format a view of `res` gets on the PC. The console lets a view name a depth format of
+/// another family than the resource's (a D32_FLOAT or D16 view of a depth + stencil buffer, and
+/// its own D16S8 family, which the resource got as the PC's D24S8): a Windows driver takes or
+/// refuses that, Metal under D3DMetal ends the process on its assertion. The view gets the
+/// resource's family: its depth format for a depth view, its depth-plane format for a read.
+unsafe fn view_format_for(res: *mut c_void, format: i32, depth_view: bool) -> i32 {
+    let vf = super::device_x::pc_format(format as u32) as i32;
+    let Some(rf) = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc().Format.0) else { return vf };
+    let other_family = matches!(vf, 39..=41 | 53..=56);
+    let fixed = match rf {
+        19..=22 if other_family => if depth_view { 20 } else { 21 },
+        44..=47 if other_family => if depth_view { 45 } else { 46 },
+        _ => vf,
+    };
+    if fixed != format {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 6 {
+            crate::xlog_info!("D3D12.X: a {} view with format {format} of a resource with format {rf} is created with format {fixed}", if depth_view { "depth" } else { "shader" });
+        }
+    }
+    fixed
+}
+
+unsafe extern "system" fn dev_create_dsv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateDepthStencilView")));
+    if desc.is_null() || res.is_null() {
+        return f(this, res, desc, handle);
+    }
+    let mut d: D3D12_DEPTH_STENCIL_VIEW_DESC = std::ptr::read_unaligned(desc as *const D3D12_DEPTH_STENCIL_VIEW_DESC);
+    d.Format.0 = view_format_for(res, d.Format.0, true);
+    f(this, res, &d as *const _ as *const c_void, handle);
+}
 
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
