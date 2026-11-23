@@ -181,7 +181,10 @@ fn decommit_tiles(
             }
         }
     }
-    if !unmapped.is_empty() {
+    // (a long list is pruned where it is used, `live_zero_runs`: a title that maps a pool of
+    // 99,776 pages page by page left ten thousands of partly empty tiles, and a scan of them for
+    // every tile that became empty kept its loading thread here for minutes)
+    if !unmapped.is_empty() && to_zero.len() <= 256 {
         to_zero.retain(|&(za, _)| mapped.contains_key(&(za & !(TILE - 1))));
     }
     unmapped
@@ -1138,7 +1141,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if s.window_index(va).is_none() {
         return;
     }
-    let zeroed = std::mem::take(&mut s.to_zero);
+    let zeroed = s.live_zero_runs();
     if !zeroed.is_empty() {
         for &(a, n) in &zeroed {
             s.clear_sent_range(a, n);
@@ -1246,6 +1249,13 @@ pub unsafe fn decommitted(a: usize, n: usize) {
 }
 
 impl State {
+    /// The ranges to clear, without those of tiles that lost their video memory since.
+    fn live_zero_runs(&mut self) -> Vec<(usize, usize)> {
+        let mut runs = std::mem::take(&mut self.to_zero);
+        runs.retain(|&(za, _)| self.mapped.contains_key(&(za & !(TILE - 1))));
+        runs
+    }
+
     /// a pool tile no window maps and no buffer uses goes back to the free list
     fn release_if_unused(&mut self, tile: (u32, u32)) {
         if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) {
@@ -1293,7 +1303,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let Some(s) = g.as_mut() else { return };
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    let zero_runs = std::mem::take(&mut s.to_zero);
+    let zero_runs = s.live_zero_runs();
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
     }
