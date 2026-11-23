@@ -4888,6 +4888,14 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        // the newer layout's #31: UpdatePageMappings(batch count, batches, page pool address, a
+        // count, 0) – which pool pages the GPU sees at the addresses a title places its pool's
+        // resources at (`gpu_views`; as a stub the textures there that the pairing of the two
+        // reservations does not reach read as zeros: a retail game's menu images)
+        29 if shifted => {
+            super::gpu_views::update(a1 as u32, a2 as *const u8, a3, a4 as u32);
+            0
+        }
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
