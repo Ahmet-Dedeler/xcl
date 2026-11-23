@@ -1972,6 +1972,14 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", d.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
         }
     }
+    // a texture view takes the resource's depth family, as a shader view does (the console
+    // writes its D16S8 depth buffer as a UAV with a 16-bit format)
+    let fixed = desc.as_ref().filter(|v| !res.is_null() && v.ViewDimension != D3D12_UAV_DIMENSION_BUFFER).map(|v| {
+        let mut v = *v;
+        v.Format.0 = view_format_for_kind(res, v.Format.0, "unordered access");
+        v
+    });
+    let desc = fixed.as_ref().map_or(desc, |v| v as *const _);
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, counter, desc, cpu) };
     f(this, res, counter, desc, slot.pc_uav);
     super::console_heap::publish(&slot, true);
@@ -4182,11 +4190,16 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 /// refuses that, Metal under D3DMetal ends the process on its assertion. The view gets the
 /// resource's family: its depth format for a depth view, its depth-plane format for a read.
 unsafe fn view_format_for(res: *mut c_void, format: i32, depth_view: bool) -> i32 {
+    view_format_for_kind(res, format, if depth_view { "depth" } else { "shader" })
+}
+
+unsafe fn view_format_for_kind(res: *mut c_void, format: i32, kind: &str) -> i32 {
+    let depth_view = kind == "depth";
     let vf = super::device_x::pc_format(format as u32) as i32;
     let Some(rd) = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()) else { return vf };
     let rf = rd.Format.0;
     if matches!(rf, 19..=22 | 39..=41 | 44..=47 | 53..=56) && std::env::var_os("XCL_TRACE_DEPTH_VIEWS").is_some() {
-        crate::xlog_info!("depth views: {} view format {format} of {res:p} (format {rf}, {}x{}x{}, {} mips, {} samples, flags {:#x})", if depth_view { "depth" } else { "shader" }, rd.Width, rd.Height, rd.DepthOrArraySize, rd.MipLevels, rd.SampleDesc.Count, rd.Flags.0);
+        crate::xlog_info!("depth views: {kind} view format {format} of {res:p} (format {rf}, {}x{}x{}, {} mips, {} samples, flags {:#x})", rd.Width, rd.Height, rd.DepthOrArraySize, rd.MipLevels, rd.SampleDesc.Count, rd.Flags.0);
         crate::log::flush();
     }
     let other_family = matches!(vf, 39..=41 | 53..=56);
@@ -4199,7 +4212,7 @@ unsafe fn view_format_for(res: *mut c_void, format: i32, depth_view: bool) -> i3
     if fixed != format {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 6 {
-            crate::xlog_info!("D3D12.X: a {} view with format {format} of a resource with format {rf} is created with format {fixed}", if depth_view { "depth" } else { "shader" });
+            crate::xlog_info!("D3D12.X: a {} view with format {format} of a resource with format {rf} is created with format {fixed}", kind);
         }
     }
     fixed
