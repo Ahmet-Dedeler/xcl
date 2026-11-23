@@ -1828,3 +1828,48 @@ Little is left to do without the exe – the rest needs an actual run of the gam
 - Seen: sign-in screen (#20202C, bottom bar), after A the intro video as flat 0xff008700 (its three planes sample
   as zero), then a front-end page with part of its text missing. `XCL_TRACE_FRAME` + `XCL_FRAME_DUMP` hung once at
   the dump of frame 470 (not diagnosed); `present::forget` drops freed resources from the trace's lists.
+
+## The intro video shows pictures (lane video, 2026-11-24; D3DMetal, 15 live runs)
+- **What the video is:** CPU Bink. The exe imports `BinkRegisterFrameBuffers` / `BinkDoFrameAsyncMulti` /
+  `BinkDoFrameAsyncWait` and none of Bink's GPU-buffer calls; its player (image +0x442f760) locks its plane textures
+  once (+0x5121690: `Map`, then an address in the range at +0x9e1dad0 is rebased to the one at +0x9e1dac0) and hands
+  the pointers to Bink, which writes them every frame. The planes are nine R8 title textures made before sign-in
+  (three buffers of 3840x2160 + 2 x 1920x1080, pitch 3840 / 2048, console flags 0, kept in step by `title_textures`).
+- **Why they read as zeros:** the title's resource memory is a page pool with two address ranges of 24 GiB
+  (+0x1e6c110; seen: CPU range 0x720000000, GPU range 0x7000000000, pool of 99,776 pages registered at 0xd20000000):
+  pages are mapped for the CPU with `XMemMapPhysicalPagesScatter` in one, and for the GPU with command queue #31 of
+  the newer layout in the other (+0xf2c560: the same virtual page number in both), and resources are placed in the
+  GPU's range. Queue #31 went to the queue's stub (its handler had lost its dispatch arm), so nothing was ever at
+  the addresses the textures are placed at (reserved, never committed): every texture of the pool uploaded zeros,
+  and Bink's planes, written at 0xb6f000000 …, were never looked at.
+- **Fix 1, queue #31** (`d3d12x::gpu_views`): the call's mappings are kept – GPU-view page → physical page, named
+  by its place in the pool through `kernelx::page_of_view` (a page the title maps at a second address is still
+  found by the first: `Away::ghost`); `title_textures::read_committed` reads a texture's unreadable pages where
+  the CPU has them. Arguments and structures: the doc of `gpu_views::update`.
+- **Fix 2, the decoder's writes** (`hle::bink`, `title_textures::note_cpu_write`): the title's imports of the Bink
+  DLL are wrapped (`resolver::game_dll_import`); after each decode the planes of the current buffer (`FrameNum` of
+  the title's registered structure – the DLL's `BinkGetFrameBuffersInfo` gives 0 there) are noted, and the textures
+  over that memory or over its GPU views are uploaded before the title's next submit. A texture that is one linear
+  level goes row by row from the title's memory into a staging buffer kept for it (`upload_rows`).
+- **Not only a mirror:** with `XCL_TRACE_PAGE_VIEWS=1`, after 65 calls of queue #31 (loading screens) 4,793 pages
+  had been mapped and 952 unmapped; 4,092 were at GPU address = CPU address + 0x68e0000000 (the ranges' starts
+  apart) when the call came, 701 at 16 other distances – pages not mapped in the CPU's range, still at their place
+  in the pool (0xd20000000 + k * 64 KiB). Upstream PR #283 pairs the two reservations by offset: enough for the
+  video's planes and every texture the CPU writes through its range, nothing for those 701 pages (the loading
+  screens' artwork shows here; the front end's setup pages were not captured with this build).
+- **Measured** (one run, the two ways alternating, quiet machine): 5.7 ms a plane as every upload (17 ms a 4K
+  frame; the video then ran at 15 - 20 fps), 0.8 ms by rows (2.4 ms a frame: 1.1 ms copying, 1.3 ms the list and
+  the wait); with rows only, 30.0 fps over the video's frames 1788 - 1968 (decodes #240 - #420 two seconds apart).
+  Asking Windows about an address in the 24 GiB reservation takes ~0.2 ms under Wine: `TitleMemory` keeps what it
+  found (a first version asked once a row: 47 ms a frame).
+- Switches: `XCL_BINK_WRAP=0`, `XCL_BINK_PLANES=all`, `XCL_TITLE_ROW_UPLOADS=0` / `ab`, `XCL_TRACE_VIDEO=1`, `XCL_TRACE_PAGE_VIEWS=1`,
+  `XCL_PRESS_AFTER_PICTURE=s:BUTTON` (presses counted from the first dumped frame with a picture: the loading stage
+  takes 100 - 215 s depending on what else runs), `XCL_FRAME_DUMP_FROM=n`, `XCL_TRANSLATED_IDENT` (lane text's).
+- Seen on the way: a run stopped presenting at frame ~450 with frame dumps on (as the black-frames lane saw at 470);
+  the gamepad of another running copy's user reaches every copy (buttons 0x80 / 0x40 arrived unscripted); dead code
+  left by the rebase next to queue #31's handler: `q_execute_command_lists_x`, `list_layout::for_queue`,
+  `list_x::queue_type`, `NEWER_LIST_SLOTS` (queue #35's filter of lists by queue type is not in effect).
+- Open: textures of the pool that the title fills later without a call XCL sees (DirectStorage into the CPU's
+  range) are uploaded once, when they are made – they need `note_cpu_write` from DirectStorage, or lane text's
+  content comparison reading through `read_committed`. The row upload still waits for the GPU on XCL's queue each
+  time (1.3 ms): recording it on the title's queue would drop the wait.

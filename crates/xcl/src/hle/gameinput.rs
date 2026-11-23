@@ -259,7 +259,17 @@ fn scripted() -> u32 {
     });
     // seconds since the host started, as the log's times (not since the title first polled)
     let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+    let fixed = at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g);
+    // `XCL_PRESS_AFTER_PICTURE=s:BUTTON,…`: the same, counted from the first dumped frame with
+    // a picture (`XCL_FRAME_DUMP`; `present::first_picture`) – a title's loading stage takes
+    // as long as the machine's load lets it, and a press before its first screen is lost
+    static AFTER: OnceLock<Vec<(f64, u32)>> = OnceLock::new();
+    let after = AFTER.get_or_init(|| parse_presses(&std::env::var("XCL_PRESS_AFTER_PICTURE").unwrap_or_default(), ""));
+    let relative = match super::d3d12x::present::first_picture() {
+        Some(t0) if !after.is_empty() => after.iter().filter(|&&(s, _)| t >= t0 + s && t < t0 + s + 0.2).fold(0, |b, &(_, g)| b | g),
+        _ => 0,
+    };
+    fixed | relative
 }
 
 #[link(name = "user32")]
