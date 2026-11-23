@@ -1568,6 +1568,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             m.remove(&(this as usize));
         }
         super::sparse::forget_buffer(this as usize);
+        super::present::forget(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
@@ -4574,6 +4575,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
         .collect();
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    super::list_x::cpu_geometry_before_execute(&mapped);
     super::list_x::execute_with_waits(&mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::list_x::readback_sparse_writes(this, chunk);
