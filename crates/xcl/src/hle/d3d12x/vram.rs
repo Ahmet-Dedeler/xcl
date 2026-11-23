@@ -11,7 +11,7 @@
 //! description: the same PC layout, so the same texels). The CPU never sees these textures
 //! (on the console it could, but GPU-owned targets are not CPU-written).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -35,11 +35,18 @@ struct Arena {
 unsafe impl Send for Arena {}
 
 static ARENAS: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
-static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// resource → the title address it was placed at
+static PLACED_TEXTURES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 /// A texture backed by one of the aliasable D3D12 heaps.
 pub(super) fn is_placed_texture(resource: usize) -> bool {
-    PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
+    PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains_key(&resource))
+}
+
+/// The title address a placed texture stands for: what the console's GetGPUVirtualAddress
+/// gives (unified memory – GTA VI clears a 256x256 R32F target with memset through it).
+pub(super) fn address(resource: usize) -> Option<usize> {
+    PLACED_TEXTURES.lock().unwrap().as_ref()?.get(&resource).copied()
 }
 
 pub(super) fn forget(resource: usize) {
@@ -156,7 +163,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     if hr < 0 || (*ppv).is_null() {
         return None;
     }
-    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, va);
     Some(hr)
 }
 
