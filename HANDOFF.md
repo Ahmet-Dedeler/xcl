@@ -1810,3 +1810,21 @@ Little is left to do without the exe – the rest needs an actual run of the gam
 5. Smaller: whole-wave reductions in partial waves (325 PS with a min reduction, every GPU), `image_sample_o` with an offset from a VGPR,
    smaller HLSL, further XGameRuntime APIs (XGameUI, XNetworking…), GameInput → system GameInput.dll,
    mapping physical pages at the game's address.
+
+## First pixels of the retail game on a Mac (lane black-frames, 2026-11-23; D3DMetal, 11 live runs)
+- **Why every frame was black:** the title's UI library keeps its vertex buffer (1.2 MB, stride 16) and index buffer
+  (393216 bytes) on its heap – ordinary memory, no unified memory, no PC resource. Only the indices were copied; the
+  vertex view went to the host with the title's address. Now both are copied to upload buffers
+  (`list_x::cpu_geometry`: 8 MiB chunks, reused 8 presents later; views inside a piece a recording already copied
+  share it) and copied again when the list is executed (`cpu_geometry_before_execute`). On a native host by
+  default, elsewhere `XCL_CPU_GEOMETRY=1` (a PC resource's GPU address can be readable memory by number there).
+- **Rect lists** (topology 17) are two triangles a rect, from an upload copy of the three corners
+  (`list_x::draw_rects`, `real::pso_elements`; fourth corner opposite the longest edge, each element `b + c - a`;
+  float and 8-bit UNORM elements in slot 0, else the first half as before).
+- uma-port's kernelx commits are in. On a native host both are opt-in: `XCL_GRAPHICS_PROTECT=1` stops the process
+  at 5 s (Rosetta cannot resume `vpmaskmovd` into a write-watched page: the title's heaps are in that memory);
+  `XCL_FAR_HOMES=1` ran 200 s to the same pictures once `sparse::decommit_tiles` no longer scanned the whole zero
+  list for every emptied tile (`State::live_zero_runs`).
+- Seen: sign-in screen (#20202C, bottom bar), after A the intro video as flat 0xff008700 (its three planes sample
+  as zero), then a front-end page with part of its text missing. `XCL_TRACE_FRAME` + `XCL_FRAME_DUMP` hung once at
+  the dump of frame 470 (not diagnosed); `present::forget` drops freed resources from the trace's lists.
