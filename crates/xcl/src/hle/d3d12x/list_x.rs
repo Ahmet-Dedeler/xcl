@@ -68,7 +68,7 @@ unsafe fn pc<F: Copy>(list: *mut c_void, slot: usize) -> F {
     transmute_copy(&real::orig_fn(list, slot))
 }
 
-unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+pub(super) unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
     pc::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, PC_GET_TYPE)(list)
 }
 
@@ -604,6 +604,29 @@ pub(super) fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIS
     let mut g = LIVE_QUEUES.lock().unwrap();
     g.retain(|q| q.queue != queue);
     g.push(QueueInfo { queue, device, ty });
+}
+
+/// The type of a queue console code created (None: not one of them).
+pub(super) fn queue_type(queue: usize) -> Option<D3D12_COMMAND_LIST_TYPE> {
+    LIVE_QUEUES.lock().unwrap().iter().find(|q| q.queue == queue).map(|q| q.ty)
+}
+
+/// command allocator #9 (callback, context) – past the PC's last method (Reset #8). A retail
+/// game registers `fn(.., size, alignment, .., context) -> memory` on each allocator it takes
+/// from its pool, before the first list records with it: the console runtime asks the title
+/// for command memory through it when a list's buffer runs out. XCL's lists have no buffer
+/// of the title's to grow (`title_list`: every record is a method call on the PC list), so
+/// the callback is never needed.
+pub(super) unsafe extern "system" fn allocator_memory_callback_x(this: *mut c_void, callback: usize, context: usize) -> usize {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if once(&N, 1) {
+        crate::xlog_info!(
+            "D3D12.X: command allocator #9 registers the title's command memory callback ({} with context {context:#x} on {:#x}) – XCL's lists take no title memory; never called",
+            crate::modules::describe_address(callback),
+            this as usize
+        );
+    }
+    0
 }
 
 /// Remove a released command queue so `KickoffX` never submits to a dead queue.
@@ -1165,6 +1188,18 @@ pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, compar
     wait_memory(this, va, 8, comparison, value, mask, "Wait64BitValueX");
 }
 
+/// Wait32BitValueX of the newer layout (#73; assumed to match #74): no mask argument
+pub(super) unsafe extern "system" fn wait32_newer_x(this: *mut c_void, va: u64, comparison: u32, value: u32, _flags: u32) {
+    wait_memory(this, va, 4, comparison, value as u64, u32::MAX as u64, "Wait32BitValueX");
+}
+
+/// Wait64BitValueX of the newer layout (#74): (address, comparison, value, flags) – a retail
+/// game passes (address, GREATER_EQUAL, value, 0 or 1) and nothing more; taken with the
+/// older layout's arguments its 0 / 1 was the mask, and the wait could only time out
+pub(super) unsafe extern "system" fn wait64_newer_x(this: *mut c_void, va: u64, comparison: u32, value: u64, _flags: u32) {
+    wait_memory(this, va, 8, comparison, value, u64::MAX, "Wait64BitValueX");
+}
+
 /// command list #88 Write32BitValueTopOfPipeX(address, value, flags)
 pub(super) unsafe extern "system" fn write32_top_x(this: *mut c_void, va: u64, value: u32, _flags: u32) {
     write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, "Write32BitValueTopOfPipeX");
@@ -1195,17 +1230,73 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
     super::bind::dispatch(this, x, y, z);
 }
 
-/// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
-/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
-    let b = D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }),
-        },
+/// A console list method that sets state the PC has no equivalent of (none returns a value
+/// the title reads): logged once with its arguments, nothing recorded.
+macro_rules! state_noop {
+    ($name:ident, $slot:literal, $what:literal) => {
+        pub(super) unsafe extern "system" fn $name(_this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if once(&N, 1) {
+                crate::xlog_info!(concat!("D3D12.X: command list #", $slot, "({:#x}, {:#x}, {:#x}, {:#x}) – ", $what, "; not done"), a1, a2, a3, a4);
+            }
+            0
+        }
     };
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
+}
+
+// (register 0xc3c0 / 0xc380 / 0xc280, value 0x80020000 / 0x20000, 0, mask 0xffffffffff00): the
+// only records of the per-queue state lists a retail game runs before each batch, and once on a
+// frame list – what it is is inferred from the argument shape
+state_noop!(state_131_x, 131, "a GPU register-style setter (register, value, 0, mask): the console GPU's own state");
+// (0x700000 direct / 0x100000 compute, 0, 0, mask 0xffffffffff00): same lists, same family
+state_noop!(state_132_x, 132, "a GPU state setter (value, 0, 0, mask): the console GPU's own state");
+// (BOOL): bit 6 of byte 0x55 of the bound shader record, sent when it changes
+state_noop!(state_75_x, 75, "a per-pipeline toggle (BOOL) of the newer layout, meaning unknown");
+// (2, 1) before and (2, 0) after a title's clear loop
+state_noop!(state_101_x, 101, "a mode bracket (2, on / off) around clears, meaning unknown");
+// (&{ 1, value })
+state_noop!(state_128_x, 128, "a state setter (pointer to a pair 1, value), meaning unknown");
+// (value, 1, 1)
+state_noop!(state_129_x, 129, "a state setter (value, 1, 1), meaning unknown");
+// (u64, -1 = none): per draw, sent when it changes
+state_noop!(state_142_x, 142, "a per-draw 64-bit state (-1 = none), meaning unknown");
+
+/// (mips, array slices, planes) of texture `res` for a barrier's subresource range
+unsafe fn texture_shape(res: u64) -> (u32, u32, u32) {
+    let r = res as usize as *mut c_void;
+    let Some(d) = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) else { return (1, 1, 1) };
+    let slices = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { d.DepthOrArraySize as u32 };
+    // depth-stencil formats keep stencil in a plane of its own
+    let planes = if matches!(d.Format.0, 19..=22 | 44..=47) { 2 } else { 1 };
+    (d.MipLevels as u32, slices, planes)
+}
+
+/// command list #146 Barrier(group count, groups): the PC's enhanced barriers. XCL's resources
+/// are in legacy states, so texture layout changes are recorded as transitions and barriers
+/// around unordered access as a UAV barrier (`barrier_x`; a retail game changes every texture
+/// state this way, `XboxBvhBuilder.dll` orders its build passes with it).
+pub(super) unsafe extern "system" fn barrier_x(this: *mut c_void, n: u32, groups: *const u8) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static UNDEFINED: AtomicU64 = AtomicU64::new(0);
+    if n == 0 || groups.is_null() || !crate::gpu::shader::readable(groups as usize, n as usize * 16) {
+        return;
+    }
+    let (out, c) = super::barrier_x::legacy(groups, n as usize, &mut |res| texture_shape(res), &crate::gpu::shader::readable);
+    if once(&CALLS, 1) {
+        crate::xlog_info!(
+            "D3D12.X: command list #146 Barrier: enhanced barriers are recorded as legacy ones (first call: {n} group(s), {} texture / {} buffer / {} global barrier(s) → {} legacy)",
+            c.textures,
+            c.buffers,
+            c.globals,
+            out.len()
+        );
+    }
+    if c.undefined + c.unknown != 0 && once(&UNDEFINED, 4) {
+        crate::xlog_warn!("D3D12.X: Barrier: {} texture barrier(s) from / to the undefined layout and {} unknown group(s) not recorded (no legacy transition says that)", c.undefined, c.unknown);
+    }
+    if !out.is_empty() {
+        resource_barrier_x(this, out.len() as u32, out.as_ptr());
+    }
 }
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's

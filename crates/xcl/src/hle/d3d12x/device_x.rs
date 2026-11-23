@@ -822,22 +822,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_layout_x(this: *mut 
     create_placed_resource_x(this, va, desc, layout_state(layout), clear, riid, ppv)
 }
 
-/// The resource state (D3D12_RESOURCE_STATES) of a D3D12_BARRIER_LAYOUT (undefined: COMMON).
-pub(super) fn layout_state(layout: u32) -> u32 {
-    match layout {
-        1 => 0xAC3, // generic read
-        2 => 0x4,   // render target
-        3 => 0x8,   // unordered access
-        4 => 0x10,  // depth write
-        5 => 0x20,  // depth read
-        6 => 0xC0,  // shader resource (all stages)
-        7 => 0x800, // copy source
-        8 => 0x400, // copy dest
-        9 => 0x2000, // resolve source
-        10 => 0x1000, // resolve dest
-        _ => 0,
-    }
-}
+pub(super) use super::barrier_x::layout_state;
 
 /// device #38 GetCopyableFootprints: a console resource desc the PC rejects (total stays
 /// UINT64_MAX) is asked again as the PC desc XCL creates for it

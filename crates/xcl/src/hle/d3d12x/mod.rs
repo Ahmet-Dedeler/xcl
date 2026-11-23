@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+mod barrier_x;
 pub mod bind;
 pub mod console_heap;
 pub mod console_list;
@@ -19,6 +20,7 @@ mod fence_x;
 pub mod frame;
 pub mod guard;
 pub mod layout;
+mod list_layout;
 pub mod list_x;
 pub mod null;
 pub mod present;
