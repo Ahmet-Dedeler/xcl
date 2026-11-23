@@ -4073,7 +4073,12 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 /// resource's family: its depth format for a depth view, its depth-plane format for a read.
 unsafe fn view_format_for(res: *mut c_void, format: i32, depth_view: bool) -> i32 {
     let vf = super::device_x::pc_format(format as u32) as i32;
-    let Some(rf) = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc().Format.0) else { return vf };
+    let Some(rd) = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()) else { return vf };
+    let rf = rd.Format.0;
+    if matches!(rf, 19..=22 | 39..=41 | 44..=47 | 53..=56) && std::env::var_os("XCL_TRACE_DEPTH_VIEWS").is_some() {
+        crate::xlog_info!("depth views: {} view format {format} of {res:p} (format {rf}, {}x{}x{}, {} mips, {} samples, flags {:#x})", if depth_view { "depth" } else { "shader" }, rd.Width, rd.Height, rd.DepthOrArraySize, rd.MipLevels, rd.SampleDesc.Count, rd.Flags.0);
+        crate::log::flush();
+    }
     let other_family = matches!(vf, 39..=41 | 53..=56);
     let fixed = match rf {
         39..=41 if matches!(vf, 19..=22 | 44..=47 | 53..=56 | 39) => if depth_view { 40 } else { 41 },
