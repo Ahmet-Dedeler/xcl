@@ -723,10 +723,13 @@ pub fn pc_format(f: u32) -> u32 {
             19 | 44 => 39,
             20 | 45 | 118 => 40,
             21 | 22 | 46 | 47 | 119 | 120 => 41,
+            // the console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT: half floats hold them
+            116 | 117 => 10,
             f => f,
         };
     }
     match f {
+        116 | 117 => 10,
         118 => 45,
         119 => 46,
         120 => 47,
