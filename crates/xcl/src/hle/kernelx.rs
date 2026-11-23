@@ -159,10 +159,20 @@ const MEM_WRITE_WATCH: u32 = 0x20_0000;
 /// commits 4.4 GiB that way, 0.5 – 2 GiB at a time, and places buffers there).
 const PAGE_GRAPHICS_ACCESS: u32 = 0x1_F000;
 
-/// `XCL_GRAPHICS_PROTECT=0`: such memory comes from Windows, as it did (the GPU does not see it).
+/// `XCL_GRAPHICS_PROTECT=0`: such memory comes from Windows, as it did (the GPU does not see it);
+/// `=1`: from the sparse windows on every host. Without the switch it is off on a native host
+/// (D3DMetal under Wine on a Mac): the windows are write-watched, Wine watches by protecting
+/// pages, and Rosetta cannot resume an AVX2 masked store that faults – a retail game keeps its
+/// heaps in this memory, and its first vectorised array fill (`vpmaskmovd [rax], ymm7, ymm6` at
+/// image +0x1d6f0a2) stopped the process 5 s into the run ("rosetta error: unexpectedly need
+/// to EmulateForward on a synchronous exception").
 fn graphics_protect(p: u32) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    p & PAGE_GRAPHICS_ACCESS != 0 && *ON.get_or_init(|| std::env::var("XCL_GRAPHICS_PROTECT").map_or(true, |v| v != "0"))
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    p & PAGE_GRAPHICS_ACCESS != 0
+        && match *ON.get_or_init(|| std::env::var("XCL_GRAPHICS_PROTECT").ok().map(|v| v.trim() != "0")) {
+            Some(on) => on,
+            None => !crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed),
+        }
 }
 
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
@@ -996,7 +1006,16 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
     };
     // (a sparse home is committed when it is used: `home_again`)
     let in_windows = || u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| p).or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize)).map(|block| (block - u.base()) / PHYS_PAGE);
-    let first = if bytes > crate::gpu::uma::WINDOW { far_homes(bytes).or_else(in_windows) } else { in_windows().or_else(|| far_homes(bytes)) };
+    // `XCL_FAR_HOMES=0`: homes in the windows first, whatever the size (as it was); `=1`: a large
+    // block's outside them on every host. Without the switch a native host (D3DMetal under
+    // Wine) keeps the old order: with the homes outside, a retail game's 6 GiB pool lands in a
+    // write-watched sparse window and the title showed no frame in 200 s there.
+    static FAR: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let far_first = match *FAR.get_or_init(|| std::env::var("XCL_FAR_HOMES").ok().map(|v| v.trim() != "0")) {
+        Some(on) => on,
+        None => !crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed),
+    };
+    let first = if far_first && bytes > crate::gpu::uma::WINDOW { far_homes(bytes).or_else(in_windows) } else { in_windows().or_else(|| far_homes(bytes)) };
     let Some(first) = first else {
         crate::xlog_warn!("AllocateTitlePhysicalPages({n}): no room in UMA");
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
