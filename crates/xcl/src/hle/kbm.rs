@@ -183,6 +183,23 @@ struct RawMouseInput {
 
 const WM_INPUT: u32 = 0x00FF;
 const WM_ACTIVATE: u32 = 0x0006;
+const WM_KILLFOCUS: u32 = 0x0008;
+const WM_ACTIVATEAPP: u32 = 0x001C;
+const WM_MOUSEACTIVATE: u32 = 0x0021;
+const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+
+/// Background mode: whether a person has clicked the XCL window since it last lost the
+/// activation. Under Wine on macOS a window shown without activation is still the
+/// foreground window as Windows sees it, and the async key state follows the whole machine's
+/// keyboard – keys typed in other programs would play the title. So in that mode the keyboard
+/// and the mouse count only between a click on the window and its deactivation.
+static CLICKED: AtomicBool = AtomicBool::new(false);
+
+/// Whether keyboard and mouse input belongs to the title now (always, outside background mode:
+/// the foreground-window test of the callers decides there).
+pub fn input_is_ours() -> bool {
+    !background() || CLICKED.load(Ordering::Acquire)
+}
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_SIZE: u32 = 0x0005;
 const WM_MOVE: u32 = 0x0003;
@@ -309,6 +326,13 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
         return false;
     }
     match msg {
+        WM_MOUSEACTIVATE | WM_LBUTTONDOWN | WM_NCLBUTTONDOWN => CLICKED.store(true, Ordering::Release),
+        WM_KILLFOCUS => CLICKED.store(false, Ordering::Release),
+        WM_ACTIVATE if wp & 0xFFFF == 0 => CLICKED.store(false, Ordering::Release),
+        WM_ACTIVATEAPP if wp == 0 => CLICKED.store(false, Ordering::Release),
+        _ => {}
+    }
+    match msg {
         WM_INPUT => {
             let mut raw = RawMouseInput::default();
             let mut size = std::mem::size_of::<RawMouseInput>() as u32;
@@ -402,7 +426,7 @@ pub fn apply(s: &mut GamepadState) {
         return;
     }
     let hwnd = WINDOW.load(Ordering::Acquire);
-    let focused = hwnd != 0 && unsafe { GetForegroundWindow() } as isize == hwnd;
+    let focused = hwnd != 0 && unsafe { GetForegroundWindow() } as isize == hwnd && input_is_ours();
     if !focused {
         // Alt+Tab, another window: the cursor is free, nothing is pressed
         // SAFETY: `hold_cursor(..., false)` only releases the cursor clip when captured.
