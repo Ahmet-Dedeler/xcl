@@ -11,7 +11,8 @@
 //!   GetResourceSizeBytes, GetResourceBaseAlignmentBytes, GetMipLevelOffsetBytes(plane, mip),
 //!   GetTexelElementOffsetBytes(plane, mip, x, y, slice, sample, bit*), GetTexelCoordinate,
 //!   CopyIntoSubresource(dst, plane, subresource, src, row pitch, slice pitch),
-//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch), then 2 more.
+//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch),
+//!   GetResourceTiling (`get_resource_tiling`), then 5 more.
 //! * XG_RESOURCE_LAYOUT (0x1B40): size @0, alignment @8, mips @0x10, planes @0x14, planes
 //!   from 0x18, 0x6C8 bytes each (usage @0, size @8, slice size @0x10, alignment @0x20, bytes
 //!   per element @0x28, first mip in the tail @0x2C, mips in the tail @0x30, then 15 mips of
@@ -278,6 +279,13 @@ impl Texture {
         }
     }
 
+    /// The 64 KiB tiles of a reserved 2D texture and the pixels per element side
+    /// (`Chain::tiling`); None: more than one plane, a volume, or no 64 KiB blocks.
+    pub fn tiling(&self) -> Option<(crate::gpu::tiling::Tiling, u32)> {
+        let s = self.texels().filter(|s| self.dimension == 3 && self.planes.len() == 1 && s.depth == 0)?;
+        Some((s.chain.tiling(s.array as usize)?, s.side))
+    }
+
     /// the surface the texels are in (None: the library leaves them out)
     pub fn texels(&self) -> Option<&Surface> {
         self.plane_surface(self.main as u32).map(|(s, _)| s)
@@ -484,8 +492,9 @@ fn vtbl() -> &'static [usize] {
             not_implemented as usize,
             copy_into as usize,
             copy_from as usize,
+            get_resource_tiling as usize,
         ];
-        for i in v.len()..12 {
+        for i in v.len()..16 {
             let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
             v.push(stub);
         }
@@ -596,6 +605,45 @@ unsafe extern "system" fn not_implemented(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
 
+/// #10 (a retail game, for its streaming textures: `Layout` 0x10A): ID3D12Device's
+/// GetResourceTiling without the resource – (tiles of the whole resource, D3D12_PACKED_MIP_INFO,
+/// D3D12_TILE_SHAPE, tilings in / out, first tiling, D3D12_SUBRESOURCE_TILING[]). The title
+/// reads the tile count, the two mip counts and each standard level's tiles across / down /
+/// first tile; a failure leaves it with a texture of no tiles.
+unsafe extern "system" fn get_resource_tiling(p: *mut c_void, tiles: *mut u32, packed: *mut u8, shape: *mut [u32; 3], count: *mut u32, first: u32, out: *mut u8) -> HRESULT {
+    let Some((t, side)) = tex(p).tiling() else {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!("XGTextureAddressComputer::GetResourceTiling: not a 2D texture of 64 KiB blocks – E_NOTIMPL");
+        }
+        return E_NOTIMPL;
+    };
+    if !tiles.is_null() {
+        *tiles = t.tiles;
+    }
+    if !packed.is_null() {
+        *packed = t.standard;
+        *packed.add(1) = t.packed;
+        (packed.add(4) as *mut u32).write_unaligned(t.packed_tiles);
+        (packed.add(8) as *mut u32).write_unaligned(0); // the tail is a slice's first block
+    }
+    if !shape.is_null() {
+        shape.write_unaligned([t.shape.0 * side, t.shape.1 * side, 1]);
+    }
+    if !count.is_null() {
+        let n = (*count as usize).min(t.subresources.len().saturating_sub(first as usize));
+        for (k, &(w, h, start)) in t.subresources.iter().skip(first as usize).take(if out.is_null() { 0 } else { n }).enumerate() {
+            let r = out.add(12 * k);
+            (r as *mut u32).write_unaligned(w);
+            (r.add(4) as *mut u16).write_unaligned(h as u16);
+            (r.add(6) as *mut u16).write_unaligned(u16::from(start != u32::MAX));
+            (r.add(8) as *mut u32).write_unaligned(start);
+        }
+        *count = n as u32;
+    }
+    S_OK
+}
+
 /// (surface, its offset, level, slice) of a subresource (mip + slice × mips) of a plane
 fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usize, usize)> {
     let (s, at) = t.plane_surface(plane)?;
@@ -679,5 +727,29 @@ mod tests {
         assert_eq!(offsets, [0x20000, 0x10000, 0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x600, 0x500]);
         assert_eq!((mip(2, 0), mip(2, 9), mip(2, 10), mip(2, 18), mip(6, 9), mip(6, 10)), (0x8000, 0x40, 0x80, 1, 8, 8));
         assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
+    }
+
+    /// Computer #10 as the title calls it for a streaming texture (64KB_D, room for 16
+    /// tilings): the same RGBA8 256×256 chain – mip 0 four blocks at 0x20000, mip 1 one at
+    /// 0x10000, the tail in the first.
+    #[test]
+    fn resource_tiling_of_a_64kb_d_texture() {
+        unsafe {
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGCreateTextureComputer(desc(256, 256, 1, 0, 28, 0x10A).as_ptr(), &mut c), S_OK);
+            type F = unsafe extern "system" fn(*mut c_void, *mut u32, *mut u8, *mut [u32; 3], *mut u32, u32, *mut u8) -> HRESULT;
+            let f: F = std::mem::transmute(*(*(c as *const *const usize)).add(10));
+            let (mut tiles, mut packed, mut shape, mut n, mut out) = (0u32, [0u8; 12], [0u32; 3], 16u32, [0u8; 16 * 12]);
+            assert_eq!(f(c, &mut tiles, packed.as_mut_ptr(), &mut shape, &mut n, 0, out.as_mut_ptr()), S_OK);
+            assert_eq!((tiles, packed[0], packed[1], packed[4], shape, n), (6, 2, 7, 1, [128, 128, 1], 9));
+            assert_eq!(out[..24], [2, 0, 0, 0, 2, 0, 1, 0, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0]);
+            assert_eq!(out[24..36], [0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+            release(c);
+            // 4KB_S: no 64 KiB tiles – refused, nothing written
+            assert_eq!(XGCreateTextureComputer(desc(256, 256, 1, 0, 28, 0x105).as_ptr(), &mut c), S_OK);
+            let f: F = std::mem::transmute(*(*(c as *const *const usize)).add(10));
+            assert_eq!((f(c, &mut tiles, packed.as_mut_ptr(), &mut shape, &mut n, 0, out.as_mut_ptr()), tiles, n), (E_NOTIMPL, 6, 9));
+            release(c);
+        }
     }
 }

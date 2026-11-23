@@ -262,6 +262,23 @@ pub struct Chain {
     pub slice_bytes: usize,
 }
 
+/// `Chain::tiling`: the tiles (64 KiB) of a reserved texture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tiling {
+    /// tiles of the whole resource (every slice)
+    pub tiles: u32,
+    /// levels with tiles of their own / levels in the mip tail
+    pub standard: u8,
+    pub packed: u8,
+    /// tiles the mip tail takes in a slice (it is the slice's first tile)
+    pub packed_tiles: u32,
+    /// a tile in elements (BCn: 4 × 4 pixel blocks)
+    pub shape: (u32, u32),
+    /// per subresource (level + slice × levels): tiles across, tiles down, its first tile in
+    /// the resource; a level in the tail: (0, 0, 0xFFFFFFFF)
+    pub subresources: Vec<(u32, u32, u32)>,
+}
+
 impl Chain {
     /// `width` × `height` pixels, `side` pixels per element side (4 for BCn), `mips` levels;
     /// a level is the pixel size halved, rounded up to whole elements (as D3D12 sizes it).
@@ -340,6 +357,43 @@ impl Chain {
             levels[i] = MipLevel { width: w, height: h, depth: depth_of(i), offset: 0, pitch: bw, origin: (mx * w256, my * h256), tail: Some(at) };
         }
         Chain { layout, levels, slice_bytes: offset }
+    }
+
+    /// What D3D12's GetResourceTiling says of a reserved (tiled) texture with this chain and
+    /// `slices` array slices: a tile is one 64 KiB block of the layout, so a level outside the
+    /// mip tail has the tiles its blocks are, at the place the chain gives them, and the levels
+    /// in the tail share one tile per slice (the packed mips). `None`: not a 2D layout of
+    /// 64 KiB blocks (the title's streaming textures are 64KB_D, mode 10).
+    pub fn tiling(&self, slices: usize) -> Option<Tiling> {
+        let l = &self.layout;
+        if l.block_bytes != 0x1_0000 || l.block_d != 1 || slices == 0 {
+            return None;
+        }
+        let first_tail = self.levels.iter().position(|m| m.tail.is_some()).unwrap_or(self.levels.len());
+        let per_slice = self.slice_bytes / l.block_bytes;
+        let mut subresources = Vec::with_capacity(slices * self.levels.len());
+        for k in 0..slices {
+            for (i, m) in self.levels.iter().enumerate() {
+                if i >= first_tail {
+                    subresources.push((0, 0, u32::MAX)); // D3D12_PACKED_TILE
+                    continue;
+                }
+                // the level's blocks end where the next larger level's begin
+                let end = if i == 0 { self.slice_bytes } else { self.levels[i - 1].offset };
+                let across = m.pitch / l.block_w;
+                let down = (end - m.offset) / l.block_bytes / across.max(1);
+                subresources.push((across as u32, down as u32, (k * per_slice + m.offset / l.block_bytes) as u32));
+            }
+        }
+        let packed = self.levels.len() - first_tail;
+        Some(Tiling {
+            tiles: (slices * per_slice) as u32,
+            standard: first_tail as u8,
+            packed: packed as u8,
+            packed_tiles: u32::from(packed != 0),
+            shape: (l.block_w as u32, l.block_h as u32),
+            subresources,
+        })
     }
 
     /// Slices a 3D texture takes (depth slices, or thick layers of `block_d` of them).
@@ -603,6 +657,36 @@ mod tests {
         assert_eq!((l.block_w, l.block_h), (16, 16));
         assert_eq!(l.offset(5, 3, 16), 3 * 16 + 5);
         assert_eq!(l.offset(1, 16, 32), 2 * 256 + 1); // second block row of a 2-block-wide surface
+    }
+
+    /// 64KB_D (the mode the title gives its streaming textures): the tiles are the chain's
+    /// blocks, the tail is one tile at the start of each slice.
+    #[test]
+    fn reserved_texture_tiles_are_the_chains_blocks() {
+        let cfg = PipeConfig { pipes_log2: 4, pkrs_log2: 4 };
+        // 4096 × 4096 BC7 (1024 × 1024 elements of 16 B), 13 levels: a block is 64 × 64 elements
+        let c = Chain::new(Layout::new(10, 4, cfg).unwrap(), 4096, 4096, 4, 13);
+        let t = c.tiling(1).unwrap();
+        assert_eq!(t.shape, (64, 64));
+        assert_eq!((t.standard, t.packed, t.packed_tiles), (5, 8, 1));
+        assert_eq!(t.tiles as usize, c.slice_bytes / 0x1_0000);
+        assert_eq!(&t.subresources[..5], &[(16, 16, 86), (8, 8, 22), (4, 4, 6), (2, 2, 2), (1, 1, 1)]);
+        assert!(t.subresources[5..].iter().all(|&s| s == (0, 0, u32::MAX)));
+        // what the title computes: the tiles left after the standard levels are the tail's
+        let own: u32 = t.subresources.iter().map(|s| s.0 * s.1).sum();
+        assert_eq!(t.tiles - own, t.packed_tiles);
+        // an array: each slice a chain further on
+        let a = c.tiling(3).unwrap();
+        assert_eq!(a.tiles, 3 * t.tiles);
+        assert_eq!(a.subresources[13], (16, 16, 86 + t.tiles));
+        assert_eq!(a.subresources.len(), 39);
+        // one level, not a multiple of the block: padded to whole blocks, no tail
+        let one = Chain::new(Layout::new(10, 2, cfg).unwrap(), 300, 130, 1, 1).tiling(1).unwrap();
+        assert_eq!((one.shape, one.standard, one.packed, one.packed_tiles), ((128, 128), 1, 0, 0));
+        assert_eq!((one.tiles, one.subresources.clone()), (6, vec![(3, 2, 0)]));
+        // 4 KiB blocks and linear are not tiles
+        assert_eq!(Chain::new(Layout::new(5, 2, cfg).unwrap(), 256, 256, 1, 1).tiling(1), None);
+        assert_eq!(Chain::new(Layout::new(0, 2, cfg).unwrap(), 256, 256, 1, 1).tiling(1), None);
     }
 
     #[test]
