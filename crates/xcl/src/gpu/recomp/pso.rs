@@ -145,7 +145,7 @@ pub fn console_to_dxil_shared(blob: &[u8], stage: Stage, sampler_base: u32, spli
 /// ~2 800 programs (611 of more than 10 000 instructions) took its loading threads 0.1 - 0.3 s
 /// each at every start. Keyed by two hashes and the length of the bytes, the stage and the
 /// translation parameters; the XCL binary's hash is in each file (another build: a miss).
-/// `XCL_TRANSLATED_CACHE=0` turns it off.
+/// `XCL_TRANSLATED_CACHE=0` turns it off; `XCL_TRANSLATED_IDENT=<hex>` stands for the hash.
 mod translated {
     use super::{Compiled, Stage};
     use std::path::{Path, PathBuf};
@@ -159,6 +159,13 @@ mod translated {
         *I.get_or_init(|| {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
+            }
+            // `XCL_TRANSLATED_IDENT=<hex>`: that identity instead of the binary's hash – builds
+            // that differ outside the translator share their translations (a developer's
+            // switch: a new build's first run otherwise translates every program again, minutes
+            // of a retail game's start on a slow host)
+            if let Some(n) = std::env::var("XCL_TRANSLATED_IDENT").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
+                return n | 1;
             }
             std::env::current_exe().and_then(std::fs::read).map_or(0, |b| crate::gpu::shader::fnv64(&b) | 1)
         })
