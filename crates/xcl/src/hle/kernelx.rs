@@ -899,6 +899,24 @@ fn lazy_home(home: usize) -> bool {
     crate::gpu::uma::get().is_none_or(|u| u.is_sparse(home) || !u.contains(home))
 }
 
+/// A physical page number for a log line: its index, the block it is of, its home and where
+/// it is mapped (what `resolve_physical_pages` goes by).
+pub fn describe_physical_page(page: usize) -> String {
+    let Some(index) = page_index(page) else { return format!("{page:#x}: not a page number") };
+    let block = PHYS_BLOCKS.lock().ok().and_then(|b| b.range(..=index).next_back().map(|(&first, &(count, live, home))| (first, count, live, home)));
+    let away = AWAY.try_lock().ok().and_then(|g| g.as_ref().and_then(|a| a.page.get(&page).copied()));
+    match block {
+        Some((first, count, live, home)) if index < first + count => format!(
+            "{page:#x}: page {} of a block of {count} ({live} allocated) with homes from {home:#x}; mapped at {}; home committed: {}",
+            index - first,
+            away.map_or("its home".to_string(), |a| format!("{a:#x}")),
+            page_home(page).is_some_and(committed_page)
+        ),
+        Some((first, count, ..)) => format!("{page:#x}: index {index} is past the block before it ({first} + {count})"),
+        None => format!("{page:#x}: index {index} is in no block"),
+    }
+}
+
 /// Resolve the live virtual addresses of the physical pages covering `offset..offset+len`.
 /// Caller must hold `AWAY`.
 unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: usize, len: usize) -> Option<Vec<usize>> {

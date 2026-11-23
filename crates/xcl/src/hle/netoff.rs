@@ -38,7 +38,15 @@ extern "system" {
     fn real_getaddrinfo_w(node: *const u16, service: *const u16, hints: *const c_void, out: *mut *mut c_void) -> i32;
     #[link_name = "gethostname"]
     fn real_gethostname(name: *mut u8, len: i32) -> i32;
+    #[link_name = "bind"]
+    fn real_bind(s: usize, name: *const u8, len: i32) -> i32;
 }
+
+/// DLLs through which a title could reach the network besides WinHTTP and Winsock 2 (whose
+/// calls that send are answered here): with the network off every import of them is a stub
+/// that fails and LoadLibrary / GetProcAddress find nothing in them (`hle::build`). None of a
+/// retail game's modules imports one today; the block must not depend on that.
+pub const OTHER_NETWORK_DLLS: [&str; 8] = ["wininet.dll", "mswsock.dll", "websocket.dll", "urlmon.dll", "msquic.dll", "httpapi.dll", "webservices.dll", "winhttpcom.dll"];
 
 /// A name that resolves without a network: none (the local addresses), this machine's own
 /// name, localhost – a console without a network still answers these (a retail game asks for
@@ -66,6 +74,10 @@ pub fn enabled() -> bool {
 fn table() -> Vec<(&'static str, usize, u16)> {
     vec![
         ("WinHttpSendRequest", send_request as *const () as usize, 0),
+        // (nothing is sent before WinHttpSendRequest; these two look for a proxy on the network)
+        ("WinHttpGetProxyForUrl", no_proxy as *const () as usize, 0),
+        ("WinHttpDetectAutoProxyConfigUrl", no_proxy as *const () as usize, 0),
+        ("bind", bind as *const () as usize, 2),
         ("connect", connect as *const () as usize, 4),
         ("sendto", sendto as *const () as usize, 20),
         ("gethostbyname", gethostbyname as *const () as usize, 52),
@@ -225,6 +237,45 @@ unsafe extern "system" fn send_request(_req: *mut c_void, _headers: *const u16, 
     0
 }
 
+/// WinHttpGetProxyForUrl / WinHttpDetectAutoProxyConfigUrl: no proxy is looked for (WPAD asks
+/// DHCP and DNS).
+unsafe extern "system" fn no_proxy(_a: usize, _b: usize, _c: usize, _d: usize) -> i32 {
+    note("WinHTTP proxy detection");
+    SetLastError(12180); // ERROR_WINHTTP_AUTODETECTION_FAILED
+    0
+}
+
+/// `name` (sockaddr_in / sockaddr_in6) with the loopback address in place of any other, the
+/// port and the rest kept; None: another family, or loopback already.
+unsafe fn loopback_of(name: *const u8, len: i32) -> Option<Vec<u8>> {
+    if name.is_null() || len < 8 || loopback(name, len) {
+        return None;
+    }
+    let mut a = std::slice::from_raw_parts(name, len as usize).to_vec();
+    match (name as *const u16).read_unaligned() {
+        2 => a[4..8].copy_from_slice(&[127, 0, 0, 1]),
+        23 if len >= 24 => {
+            a[8..24].fill(0);
+            a[23] = 1;
+        }
+        _ => return None,
+    }
+    Some(a)
+}
+
+/// bind: a socket bound to every address, or to one of the machine's, is bound to the loopback
+/// address – nothing outside this machine reaches a port the title listens on (its own socket
+/// pairs still connect: they go through 127.0.0.1).
+unsafe extern "system" fn bind(s: usize, name: *const u8, len: i32) -> i32 {
+    match loopback_of(name, len) {
+        Some(a) => {
+            note("bind to an address other than loopback (bound to loopback)");
+            real_bind(s, a.as_ptr(), len)
+        }
+        None => real_bind(s, name, len),
+    }
+}
+
 unsafe extern "system" fn connect(s: usize, name: *const u8, len: i32) -> i32 {
     if loopback(name, len) {
         return orig_connect(s, name, len);
@@ -291,6 +342,44 @@ unsafe extern "system" fn getaddrinfo_ex(_n: *const u16, _s: *const u16, _ns: u3
 mod tests {
     use super::*;
 
+    /// With no XCL_NETWORK in the environment the network is off, and what a title's imports
+    /// and run-time lookups of the networking DLLs resolve to is XCL's, never the host's: the
+    /// calls that send (by name and by Winsock ordinal), and every function of the other DLLs.
+    #[test]
+    fn the_default_is_no_network_for_every_way_in() {
+        use crate::pe::ImportName;
+        if std::env::var_os("XCL_NETWORK").is_some() {
+            return;
+        }
+        assert!(enabled());
+        let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
+        let reg = crate::hle::registry();
+        for dll in ["winhttp.dll", "ws2_32.dll", "wsock32.dll"] {
+            assert!(matches!(reg.route(dll), Some(crate::hle::Route::Hle(_))), "{dll}");
+        }
+        for dll in OTHER_NETWORK_DLLS {
+            assert_eq!(reg.route(dll), Some(&crate::hle::Route::Stub), "{dll}");
+            // run-time lookups find nothing
+            let h = crate::resolver::load_library(dll).unwrap();
+            assert_eq!(crate::resolver::get_proc_address(h, &name("InternetOpenW")), None, "{dll}");
+        }
+        let mine: Vec<usize> = exports().iter().map(|e| e.1).collect();
+        // static imports: by name and by ordinal (a retail game imports ws2_32 by ordinal)
+        for (dll, what) in [("WINHTTP.dll", name("WinHttpSendRequest")), ("WS2_32.dll", ImportName::Ordinal(4)), ("WS2_32.dll", ImportName::Ordinal(20)), ("WS2_32.dll", ImportName::Ordinal(52)), ("WS2_32.dll", ImportName::Ordinal(2)), ("WS2_32.dll", name("getaddrinfo")), ("ws2_32.dll", name("WSAConnect")), ("WSOCK32.dll", ImportName::Ordinal(4)), ("wsock32.dll", name("sendto"))] {
+            let a = crate::resolver::resolve_import(dll, &what, "test.exe", false);
+            assert!(mine.contains(&a), "{dll} {what}");
+        }
+        // LoadLibrary + GetProcAddress, by name and by ordinal, on whatever handle the title gets
+        for (dll, what) in [("winhttp.dll", name("WinHttpSendRequest")), ("ws2_32.dll", name("connect")), ("ws2_32.dll", ImportName::Ordinal(4)), ("ws2_32.dll", ImportName::Ordinal(20))] {
+            let h = crate::resolver::load_library(dll).unwrap();
+            let a = crate::resolver::get_proc_address(h, &what).unwrap();
+            assert!(mine.contains(&a), "GetProcAddress({dll}, {what})");
+        }
+        // what does not send stays the host's (a title opens sessions and sockets without a network)
+        let h = crate::resolver::load_library("ws2_32.dll").unwrap();
+        assert!(crate::resolver::get_proc_address(h, &name("WSAStartup")).is_some_and(|a| !mine.contains(&a)));
+    }
+
     #[test]
     fn only_loopback_goes_through() {
         let v4 = |a: [u8; 4]| [2, 0, 0, 80, a[0], a[1], a[2], a[3], 0, 0, 0, 0, 0, 0, 0, 0];
@@ -304,6 +393,14 @@ mod tests {
             v6[8] = 0x20;
             assert!(!loopback(v6.as_ptr(), 28));
             assert_eq!(connect(usize::MAX, v4([8, 8, 8, 8]).as_ptr(), 16), -1);
+            // bind: any address and the machine's own become loopback, port kept
+            assert_eq!(loopback_of(v4([0, 0, 0, 0]).as_ptr(), 16), Some(v4([127, 0, 0, 1]).to_vec()));
+            assert_eq!(loopback_of(v4([192, 168, 1, 7]).as_ptr(), 16), Some(v4([127, 0, 0, 1]).to_vec()));
+            assert_eq!(loopback_of(v4([127, 0, 0, 1]).as_ptr(), 16), None);
+            let any6 = [23u8, 0, 0x1F, 0x90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let lo6 = loopback_of(any6.as_ptr(), 28).unwrap();
+            assert!(loopback(lo6.as_ptr(), 28) && lo6[2..4] == [0x1F, 0x90]);
+            assert_eq!(no_proxy(0, 0, 0, 0), 0);
             assert_eq!(send_request(std::ptr::null_mut(), std::ptr::null(), 0, std::ptr::null(), 0, 0, 0), 0);
         }
     }

@@ -188,6 +188,17 @@ pub fn install_crash_handler() {
                 }
             });
         }
+        // `XCL_CRASH_AT=<seconds>`: a deliberate access violation on a thread of XCL's at that
+        // time – to see what the title's crash handling does with it (its reporter's upload
+        // has to fail in `hle::netoff`, not at a name server)
+        if let Some(t) = std::env::var("XCL_CRASH_AT").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            let _ = std::thread::Builder::new().name("xcl-crash-test".into()).spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(t));
+                crate::xlog_warn!("XCL_CRASH_AT={t}: a deliberate access violation now (network {})", if crate::hle::netoff::enabled() { "off" } else { "ON" });
+                crate::log::flush();
+                std::ptr::write_volatile(8 as *mut u32, 0xDEAD);
+            });
+        }
         if std::env::var_os("XCL_TRACE_EXCEPTIONS").is_some() {
             windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(first_chance_logger));
         }
