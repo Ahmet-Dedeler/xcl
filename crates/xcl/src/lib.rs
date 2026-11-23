@@ -17,6 +17,7 @@ pub mod hooks;
 pub mod host;
 pub mod insn;
 pub mod inspect;
+pub mod isa;
 pub mod launcher;
 pub mod loader;
 pub mod modules;
