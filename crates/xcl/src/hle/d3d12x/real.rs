@@ -485,6 +485,15 @@ pub fn init() -> Result<String, String> {
         super::device_x::probe_dynamic_depth_bias(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
+        // The inlined D3D12.X of a retail game tests a byte of the console's device at +0x18
+        // (11 places, e.g. exe+0x6ddf5): 0 – it writes a CBV's V# and descriptor copies into
+        // the heap's memory itself; else it calls #17 / #24. Here the byte is the host
+        // object's, so which way a run goes is the host's doing: said once, for the log.
+        if crate::gpu::shader::readable(raw as usize + 0x18, 1) {
+            let b = *(raw as *const u8).add(0x18);
+            let way = if b == 0 { "writes CBVs and descriptor copies itself (no #17 / #24 calls)" } else { "calls CreateConstantBufferView / CopyDescriptorsSimple" };
+            crate::xlog_info!("D3D12.X: device byte +0x18 = {b:#04x} – console code with inlined descriptor writes {way}");
+        }
         DEVICE.store(raw as usize, Ordering::Release);
         *ADAPTER.lock().unwrap() = name.clone();
         Ok(name)
@@ -902,6 +911,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (80, super::frame::wait_frame_event_x as usize),
                 (81, super::frame::frame_statistics_x as usize),
                 (86, x::create_pipeline_state_x as usize),
+                (101, x::create_state_object_x as usize),
                 (108, x::get_resource_allocation_info2_x as usize),
                 (127, dev_create_committed_resource_layout_x as usize),
                 (133, x::create_placed_resource_layout_x as usize),

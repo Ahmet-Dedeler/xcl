@@ -594,6 +594,34 @@ pub(super) unsafe extern "system" fn set_debug_flags_x(_this: *mut c_void, _flag
     S_OK
 }
 
+/// device #101 of the newer console layout (a retail game, exe+0x24813ef): CreateStateObject(desc,
+/// IID_ID3D12StateObject, out) for its ray-tracing pipeline. The libraries in the desc are
+/// console shaders no PC driver takes, and the stub's S_OK with nothing in `out` sent the title
+/// on to call the object. It handles a failure (it goes on without the pipeline): E_NOTIMPL.
+/// Anything else at this slot (another layout's method) is answered S_OK as before.
+pub(super) unsafe extern "system" fn create_state_object_x(_this: *mut c_void, desc: *const u32, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let state_object = crate::gpu::shader::readable(riid as usize, 16) && {
+        let g = &*riid;
+        (g.data1, g.data2, g.data3, g.data4) == (0x47016943, 0xfca8, 0x4594, [0x93, 0xea, 0xaf, 0x25, 0x8b, 0x55, 0x34, 0x6d])
+    };
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let first = !ONCE.swap(true, Ordering::Relaxed);
+    if !state_object {
+        if first {
+            crate::xlog_warn!("D3D12.X: device #101 called without the state object IID – not modelled, S_OK");
+        }
+        return S_OK;
+    }
+    if first {
+        let (ty, n) = if crate::gpu::shader::readable(desc as usize, 8) { (*desc, *desc.add(1)) } else { (0, 0) };
+        crate::xlog_warn!("D3D12.X: CreateStateObject (type {ty}, {n} subobjects) from console code – ray-tracing pipelines are not translated: E_NOTIMPL");
+    }
+    if crate::gpu::shader::readable(out as usize, 8) {
+        *out = std::ptr::null_mut();
+    }
+    E_NOTIMPL
+}
+
 static PAGE_POOLS: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
 
 /// device #74 RegisterPagePoolX(address, pages, index out)

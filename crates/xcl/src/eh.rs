@@ -77,6 +77,13 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             };
             extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
         }
+        // an instruction this host does not run and XCL does not emulate (`unsupported_insn_handler`): its
+        // bytes name it without a second run
+        if rec.ExceptionCode as u32 == 0xC000_001D && crate::gpu::shader::readable(addr, 1) {
+            let mut buf = [0u8; 16];
+            let hex: Vec<String> = insn_bytes(addr, &mut buf).iter().map(|b| format!("{b:02x}")).collect();
+            extra = format!(" (code bytes: {})", hex.join(" "));
+        }
         let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
             String::new()
