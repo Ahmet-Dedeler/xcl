@@ -451,3 +451,46 @@ pub fn call_site(site: u64, site_len: u8, helper: u64) -> Option<[u8; 8]> {
     b[1..5].copy_from_slice(&rel.to_le_bytes());
     Some(b)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The encodings upstream's `insn` does not emulate are decoded here: ADCX / ADOX, RDSEED,
+    /// MOVNTSS / MOVNTSD; RDPID (F3 0F C7 /7) is left to `insn`.
+    #[test]
+    fn decodes_what_only_a_translator_lacks() {
+        // adcx rax, rcx (66 48 0F 38 F6 C1); adox r8d, r9d (F3 45 0F 38 F6 C1)
+        let i = decode(&[0x66, 0x48, 0x0F, 0x38, 0xF6, 0xC1]).unwrap();
+        assert_eq!((i.op, i.len, i.size, i.reg, i.rm), (Op::Adcx, 6, 8, 0, Rm::Reg(1)));
+        let i = decode(&[0xF3, 0x45, 0x0F, 0x38, 0xF6, 0xC1]).unwrap();
+        assert_eq!((i.op, i.len, i.size, i.reg, i.rm), (Op::Adox, 6, 4, 8, Rm::Reg(9)));
+        // rdseed rax (48 0F C7 F8); movntss [rax + 8], xmm1 (F3 0F 2B 48 08)
+        assert_eq!(decode(&[0x48, 0x0F, 0xC7, 0xF8]).map(|i| (i.op, i.size)), Some((Op::Rdseed, 8)));
+        let i = decode(&[0xF3, 0x0F, 0x2B, 0x48, 0x08]).unwrap();
+        assert_eq!((i.op, i.len, i.reg, i.rm), (Op::Movntss, 5, 1, Rm::Mem { base: Some(0), index: None, scale: 0, disp: 8, rip: false }));
+        assert_eq!(decode(&[0xF3, 0x0F, 0xC7, 0xF8]), None, "RDPID is `insn`'s");
+        assert_eq!(decode(&[0x0F, 0x01, 0xFC]), None, "a lone CLZERO is `insn`'s");
+        assert_eq!(add_carry(u64::MAX, 0, true, true), (0, true));
+        assert_eq!(add_carry(0xFFFF_FFFF, 1, false, false), (0, true));
+    }
+
+    /// INSERTQ's helper: the field mask and its complement as aligned constants, the high
+    /// quadword zeroed (as `insn::insertq`'s caller does), and a call that reaches it.
+    #[test]
+    fn insertq_helper_zeroes_the_high_quadword() {
+        // insertq xmm0, xmm1, 8, 16 (F2 0F 78 C1 08 10)
+        let mut out = [0u8; THUNK_MAX];
+        let t = thunk(&[0xF2, 0x0F, 0x78, 0xC1, 0x08, 0x10], &mut out).unwrap();
+        assert_eq!((t.op, t.site_len, t.len as usize, t.slot), (Op::InsertqImm, 6, 96, None));
+        let q = |at: usize| u64::from_le_bytes(out[at..at + 8].try_into().unwrap());
+        assert_eq!([q(64), q(72), q(80), q(88)], [0xFF_0000, 0, !0xFF_0000, 0]);
+        assert_eq!(*out[..64].iter().rev().find(|&&b| b != 0xCC).unwrap(), 0xC3, "the code ends in ret");
+        let call = call_site(0x1000, t.site_len, 0x2000).unwrap();
+        assert_eq!(call[..6], [0xE8, 0xFB, 0x0F, 0x00, 0x00, 0x90]);
+        assert_eq!(call_site(0x1000, 3, 0x2000), None, "too short for a call");
+        // the CLZERO loop's site: clzero; add rax, 0x40 – seven bytes, eight stores
+        let t = thunk(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40], &mut out).unwrap();
+        assert_eq!((t.op, t.site_len), (Op::Clzero, 7));
+    }
+}
