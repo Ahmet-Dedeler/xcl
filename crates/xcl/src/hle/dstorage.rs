@@ -933,6 +933,16 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             pages
         };
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+            // (the pages as they were when the request was made: the title's array may hold others by now)
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!(
+                    "DirectStorage: {n} bytes (page offset {}) could not be written to its {} page(s) – the first: {}",
+                    r.destination_page_offset,
+                    pages.len(),
+                    pages.first().map_or("none".to_string(), |&p| crate::hle::kernelx::describe_physical_page(p))
+                );
+            }
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
@@ -1052,10 +1062,7 @@ impl QueueInner {
                     uma.is_some_and(|u| u.is_sparse(request.destination as usize)),
                     crate::hle::kernelx::in_graphics_reservation(request.destination as usize)
                 );
-                if request.dest_physical_pages() && crate::gpu::shader::readable(request.destination as usize, 8) {
-                    let page = unsafe { (request.destination as *const usize).read_unaligned() };
-                    crate::xlog_warn!("DirectStorage: … its first page now: {}", crate::hle::kernelx::describe_physical_page(page));
-                }
+
             }
         }
         let mut e = self.errors.lock().unwrap();
