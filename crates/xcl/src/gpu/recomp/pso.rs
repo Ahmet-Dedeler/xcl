@@ -5,8 +5,9 @@
 //! directly indexed descriptor heaps (images / samplers). Mapping the title's root arguments
 //! onto that ABI at draw time is the next step (needs the console runtime's user-data layout).
 
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -15,7 +16,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use super::{dxc, interface, translate, Mode, Options};
 use crate::gpu::xbox;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     Vertex,
     Pixel,
@@ -99,6 +100,8 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<C
 /// (`wave32_only_for_device`): a wave64 compute program gets the split form
 /// (`Options::split_wave64`) instead of `[WaveSize(64)]`, which such a driver rejects.
 /// Finished shaders are also kept in memory (`ShaderCache`): pipelines share their shaders.
+/// A shader whose DXIL is not compiled yet is not translated for each of its pipelines
+/// (`Translated`).
 pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
     console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
 }
@@ -106,12 +109,20 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    console_to_dxil_shared(blob, stage, sampler_base, split_wave64, windows).map(|shader| shader.as_ref().clone())
+}
+
+/// `console_to_dxil_in` without a copy of the DXIL: the pipelines of a shader (a retail
+/// game: tens per pixel shader, clones with other fixed-function state) build from the one
+/// in `ShaderCache`.
+pub fn console_to_dxil_shared(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Arc<Compiled>, String> {
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one();
+        return compile_console_shader(blob, stage, sampler_base, windows, split_wave64).map(Arc::new);
     }
     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
+    static TRANSLATED: OnceLock<Mutex<HashMap<TranslatedKey, Arc<Translated>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)));
+    let translated = TRANSLATED.get_or_init(Default::default);
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
         stage,
@@ -120,8 +131,12 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         split_wave64,
         cache_dir: dxc::cache_dir(),
     };
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    let known = TranslatedKey { hash: key.hash, len: blob.len(), stage, sampler_base, windows, split_wave64 };
+    let dir = key.cache_dir.clone();
+    // without the debug switches (`cache_allowed`) this is `compile_console_shader`
+    let compile_one = || translated_dxil(translated, known, &dir, || console_translation(blob, stage, sampler_base, windows, split_wave64).map(|(t, profile)| (t.hlsl, profile, t.static_samplers)));
+    let from_disk = || translated::cached(&dir, blob, stage, sampler_base, windows, split_wave64, compile_one);
+    cached_shader(cache, key, blob, from_disk)
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
@@ -130,7 +145,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
 /// ~2 800 programs (611 of more than 10 000 instructions) took its loading threads 0.1 - 0.3 s
 /// each at every start. Keyed by two hashes and the length of the bytes, the stage and the
 /// translation parameters; the XCL binary's hash is in each file (another build: a miss).
-/// `XCL_TRANSLATED_CACHE=0` turns it off.
+/// `XCL_TRANSLATED_CACHE=0` turns it off; `XCL_TRANSLATED_IDENT=<hex>` stands for the hash.
 mod translated {
     use super::{Compiled, Stage};
     use std::path::{Path, PathBuf};
@@ -144,6 +159,13 @@ mod translated {
         *I.get_or_init(|| {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
+            }
+            // `XCL_TRANSLATED_IDENT=<hex>`: that identity instead of the binary's hash – builds
+            // that differ outside the translator share their translations (a developer's
+            // switch: a new build's first run otherwise translates every program again, minutes
+            // of a retail game's start on a slow host)
+            if let Some(n) = std::env::var("XCL_TRANSLATED_IDENT").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
+                return n | 1;
             }
             std::env::current_exe().and_then(std::fs::read).map_or(0, |b| crate::gpu::shader::fnv64(&b) | 1)
         })
@@ -227,6 +249,61 @@ mod translated {
         store_in(&path, ident, blob, &c);
         Ok(c)
     }
+}
+
+/// What the translation of a console shader comes to: the key of its DXIL in the disk cache
+/// (a hash of the HLSL) and its static samplers, kept for every shader translated in this
+/// run (a few dozen bytes each). `translated` has a shader only once its DXIL is compiled:
+/// until then every pipeline with it translated it again just to find that key, in the
+/// title's call (the cached-only attempt) and once more on its worker – a retail game makes
+/// tens of pipelines per pixel shader (clones with other fixed-function state).
+struct Translated {
+    dxil_key: u64,
+    samplers: Vec<StaticSampler>,
+}
+
+/// What a translation depends on. No copy of the blob to compare with: its length instead.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TranslatedKey {
+    hash: u64,
+    len: usize,
+    stage: Stage,
+    sampler_base: u32,
+    windows: u32,
+    split_wave64: bool,
+}
+
+/// DXIL of a console shader through `known`: a shader translated before comes from the disk
+/// cache by its key (inside `dxc::cached_only`: or misses, at once); `translate` (HLSL,
+/// profile, static samplers) runs for a new one, and for one whose DXIL nobody compiled.
+fn translated_dxil(
+    known: &Mutex<HashMap<TranslatedKey, Arc<Translated>>>,
+    key: TranslatedKey,
+    dir: &Path,
+    translate: impl FnOnce() -> Result<(String, &'static str, Vec<StaticSampler>), String>,
+) -> Result<Compiled, String> {
+    let before = known.lock().unwrap().get(&key).cloned();
+    if let Some(t) = &before {
+        static SKIPPED: AtomicU64 = AtomicU64::new(0);
+        let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 1000 == 0 {
+            crate::xlog_info!("[SHADER] translation of a console shader seen before skipped (#{n})");
+        }
+        if let Some(dxil) = dxc::cached_by_key_in(dir, t.dxil_key)? {
+            return Ok(Compiled { dxil, samplers: t.samplers.clone() });
+        }
+    }
+    let (hlsl, profile, samplers) = translate()?;
+    let dxil_key = match before {
+        Some(t) => t.dxil_key,
+        None => {
+            let dxil_key = dxc::cache_key(&hlsl, "main", profile);
+            known.lock().unwrap().insert(key, Arc::new(Translated { dxil_key, samplers: samplers.clone() }));
+            dxil_key
+        }
+    };
+    let dxil = dxc::compile_cached_in_keyed(dir, dxil_key, &hlsl, "main", profile)?.0;
+    Ok(Compiled { dxil, samplers })
 }
 
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
@@ -779,6 +856,52 @@ mod shader_cache_tests {
         assert!(cache.lock().unwrap().entries.is_empty());
         let t = cached_shader(&cache, key(1), b"a", || Ok(compiled(9))).unwrap();
         assert_eq!(t.dxil[0], 9);
+    }
+
+    #[test]
+    fn known_translation_is_not_repeated() {
+        let dir = std::env::temp_dir().join(format!("xcl-known-translation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let known = Mutex::new(HashMap::new());
+        let key = TranslatedKey { hash: 1, len: 100, stage: Stage::Pixel, sampler_base: 2, windows: 1, split_wave64: false };
+        let samplers: Vec<StaticSampler> = vec![([1, 2, 3, 4], true)];
+        let translate = || Ok(("known translation".to_string(), "ps_6_6", vec![([1, 2, 3, 4], true)]));
+        // first sight, DXIL not compiled: translated to learn the key, a miss for the probe
+        let (r, missed) = dxc::cached_only(|| translated_dxil(&known, key, &dir, translate));
+        assert!(r.is_err() && missed);
+        let dxil_key = known.lock().unwrap()[&key].dxil_key;
+        assert_eq!(dxil_key, dxc::cache_key("known translation", "main", "ps_6_6"));
+        // the next pipelines with it miss without translating
+        for _ in 0..3 {
+            let (r, missed) = dxc::cached_only(|| translated_dxil(&known, key, &dir, || panic!("translated again")));
+            assert!(r.is_err() && missed);
+        }
+        // compiled meanwhile (a worker): from the disk cache, still no translation
+        let dxil = dxc::cache_tests::synthetic_dxil(5);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{dxil_key:016x}.dxil")), &dxil).unwrap();
+        for cached_only in [true, false] {
+            let get = || translated_dxil(&known, key, &dir, || panic!("translated again"));
+            let c = if cached_only { dxc::cached_only(get).0 } else { get() }.unwrap();
+            assert_eq!((c.dxil, c.samplers), (dxil.clone(), samplers.clone()));
+        }
+        // another shader, the same shader for another slot: their own translations
+        for other in [TranslatedKey { hash: 2, ..key }, TranslatedKey { len: 101, ..key }, TranslatedKey { stage: Stage::Vertex, ..key }, TranslatedKey { sampler_base: 0, ..key }, TranslatedKey { windows: 2, ..key }, TranslatedKey { split_wave64: true, ..key }] {
+            let mut calls = 0;
+            let (r, missed) = dxc::cached_only(|| {
+                translated_dxil(&known, other, &dir, || {
+                    calls += 1;
+                    Ok((format!("other translation {}", known.lock().unwrap().len()), "ps_6_6", Vec::new()))
+                })
+            });
+            assert!(r.is_err() && missed && calls == 1);
+        }
+        assert_eq!(known.lock().unwrap().len(), 7);
+        // a failed translation is not remembered
+        let failed = TranslatedKey { hash: 3, ..key };
+        assert!(translated_dxil(&known, failed, &dir, || Err("incomplete translation".into())).is_err());
+        assert!(!known.lock().unwrap().contains_key(&failed));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

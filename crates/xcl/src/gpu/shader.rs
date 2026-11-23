@@ -275,23 +275,29 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
     if ptr == 0 && len == 0 {
         return; // unused stage
     }
+    // hashed before the lock, copied only when new: every stage of every pipeline comes
+    // through here, from all of the title's pipeline threads (a retail game: ~70 000
+    // pipelines of ~4 700 shaders)
+    let h = readable(ptr, len).then(|| fnv64(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }));
     let mut g = STATE.lock().unwrap();
     let st = g.get_or_insert_with(|| State { seen: HashSet::new(), stats: ShaderStats::default(), insts: xbox::InstStats::default() });
     st.stats.submitted += 1;
-    if !readable(ptr, len) {
+    let Some(h) = h else {
         st.stats.rejected_pointers += 1;
         if st.stats.rejected_pointers <= 5 {
             crate::xlog_warn!("[SHADER] {stage}: invalid pointer/size ({ptr:#x}, {len}) – different struct layout on the console?");
         }
         return;
+    };
+    match st.stats.by_stage.get_mut(stage) {
+        Some(n) => *n += 1,
+        None => drop(st.stats.by_stage.insert(stage.to_string(), 1)),
     }
-    let blob = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec();
-    let h = fnv64(&blob);
-    *st.stats.by_stage.entry(stage.to_string()).or_default() += 1;
     if !st.seen.insert(h) {
         return;
     }
     st.stats.unique += 1;
+    let blob = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec();
     let (kind, parts) = classify(&blob);
     *st.stats.by_kind.entry(kind.label().to_string()).or_default() += 1;
     for p in parts.iter().filter(|p| !KNOWN_PARTS.contains(&p.fourcc.as_str())) {
