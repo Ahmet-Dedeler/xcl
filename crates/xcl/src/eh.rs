@@ -103,6 +103,13 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             let callers = stack_callers(c.Rsp as usize);
             regs.iter().map(|(n, v)| format!(" {n}={v:#x}{}", obj(*v))).collect::<String>() + &if callers.is_empty() { String::new() } else { format!("; on the stack: {callers}") }
         };
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let v = &crate::hle::d3d12x::list_x::LAST_INDEX_VIEW;
+            if v[0].load(Relaxed) != 0 {
+                extra += &format!(" (last index buffer view: {:#x}, {} bytes; the title's {:#x})", v[0].load(Relaxed), v[1].load(Relaxed), v[2].load(Relaxed));
+            }
+        }
         let msg = format!(
             "unhandled exception {:#010x} in {}{extra}{regs}",
             rec.ExceptionCode as u32,
