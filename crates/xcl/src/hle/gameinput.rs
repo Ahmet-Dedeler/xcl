@@ -259,7 +259,17 @@ fn scripted() -> u32 {
     });
     // seconds since the host started, as the log's times (not since the title first polled)
     let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g) | remote()
+    let fixed = at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g);
+    // `XCL_PRESS_AFTER_PICTURE=s:BUTTON,…`: the same, counted from the first dumped frame with
+    // a picture (`XCL_FRAME_DUMP`; `present::first_picture`) – a title's loading stage takes
+    // as long as the machine's load lets it, and a press before its first screen is lost
+    static AFTER: OnceLock<Vec<(f64, u32)>> = OnceLock::new();
+    let after = AFTER.get_or_init(|| parse_presses(&std::env::var("XCL_PRESS_AFTER_PICTURE").unwrap_or_default(), ""));
+    let relative = match super::d3d12x::present::first_picture() {
+        Some(t0) if !after.is_empty() => after.iter().filter(|&&(s, _)| t >= t0 + s && t < t0 + s + 0.2).fold(0, |b, &(_, g)| b | g),
+        _ => 0,
+    };
+    fixed | relative | remote()
 }
 
 /// `XCL_REMOTE_INPUT=<file>`: buttons written to that file ("A", "DOWN A", names as
@@ -357,6 +367,14 @@ pub fn first_press() -> Option<f64> {
     FIRST_PRESS.get().copied()
 }
 
+/// buttons the title has seen down so far
+static SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// Whether the title has seen any button down yet (traces that start with the first press).
+pub fn any_press() -> bool {
+    SEEN.load(Ordering::Relaxed) != 0
+}
+
 /// the gamepad now
 pub fn poll() -> GamepadState {
     let mut s = xinput_pad().unwrap_or_default();
@@ -372,7 +390,6 @@ pub fn poll() -> GamepadState {
     );
     {
         // the first presses of each button: worth a line (is input arriving at all?)
-        static SEEN: AtomicU32 = AtomicU32::new(0);
         let new = s.buttons & !SEEN.fetch_or(s.buttons, Ordering::Relaxed);
         if new != 0 {
             crate::xlog_info!("GameInput: gamepad buttons {new:#x} pressed for the first time");

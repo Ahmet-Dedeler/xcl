@@ -446,6 +446,22 @@ impl Chain {
         }
     }
 
+    /// Level `i` as plain rows in memory, if it lies there that way (a linear surface with no
+    /// swizzled base): (byte offset of its first row in the slice, bytes from a row to the
+    /// next, bytes of a row's elements, rows). What the CPU writes row by row with a pitch – a
+    /// video's planes – is copied without detiling (`detile_level`, and a title texture's
+    /// upload straight from the title's memory).
+    pub fn linear_rows(&self, i: usize) -> Option<(usize, usize, usize, usize)> {
+        let l = self.levels.get(i)?;
+        let lay = &self.layout;
+        if lay.mode != 0 || lay.base_xor != 0 || l.width == 0 || l.height == 0 {
+            return None;
+        }
+        let e = 1usize << lay.elem_log2;
+        let stride = l.pitch.div_ceil(lay.block_w) * lay.block_bytes;
+        Some((l.offset + l.origin.1 * stride + l.origin.0 * e, stride, l.width * e, l.height))
+    }
+
     /// level `i` of array slice `slice` (`src` = the slice's bytes) → linear rows of elements;
     /// bytes past the end of `src` read as 0
     ///
@@ -462,12 +478,10 @@ impl Chain {
             return out;
         }
         let pitch_blocks = l.pitch.div_ceil(lay.block_w);
-        if lay.mode == 0 && lay.base_xor == 0 {
+        if let Some((first, stride, row_bytes, rows)) = self.linear_rows(i) {
             // rows of whole 256-byte blocks, one after the other
-            let row_bytes = l.width * e;
-            for y in 0..l.height {
-                let o = l.offset + (y + l.origin.1) * pitch_blocks * lay.block_bytes + l.origin.0 * e;
-                if let Some(s) = src.get(o..) {
+            for y in 0..rows {
+                if let Some(s) = src.get(first + y * stride..) {
                     let n = row_bytes.min(s.len()) / e * e; // whole elements
                     out[y * row_bytes..][..n].copy_from_slice(&s[..n]);
                 }

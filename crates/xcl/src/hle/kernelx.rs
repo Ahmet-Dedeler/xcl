@@ -768,6 +768,12 @@ struct Away {
     /// its end in runs (`tell_arrived`): a tile mapping per page on the GPU made a retail game's
     /// 99,776 pages take minutes
     arrived: Vec<usize>,
+    /// address → page for the views a page was mapped at before the title mapped it somewhere
+    /// else: on the console a page shows at every address it is mapped at, here only at the last
+    /// one (the earlier ones are decommitted). What is asked by one of those addresses (a page
+    /// pool's page by its place in the pool, `d3d12x::gpu_views`) is found through this. An
+    /// entry goes when its address is mapped again or unmapped, or its page is freed.
+    ghost: std::collections::HashMap<usize, usize>,
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 
@@ -990,6 +996,32 @@ unsafe fn unmap_away(away: &mut Away, at: usize) {
     }
 }
 
+/// The physical page (its number) the title mapped at the 64 KiB page of `view`: the one that
+/// is there now, or the last one that was there before the title mapped it somewhere else
+/// (on the console it would still show there).
+pub fn page_of_view(view: usize) -> Option<usize> {
+    let v = view & !(PHYS_PAGE - 1);
+    let g = AWAY.lock().unwrap();
+    let a = g.as_ref()?;
+    a.at.get(&v).or_else(|| a.ghost.get(&v)).copied()
+}
+
+/// The page (its number) whose data is at the 64 KiB page of `addr` now, if the title mapped
+/// one there (pages at their homes are not looked for).
+pub fn page_at(addr: usize) -> Option<usize> {
+    AWAY.lock().unwrap().as_ref()?.at.get(&(addr & !(PHYS_PAGE - 1))).copied()
+}
+
+/// Where the data of physical page `page` is now: the address the title last mapped it at, or
+/// its home while that has memory (None: a page never used, or not a live page).
+pub fn page_address(page: usize) -> Option<usize> {
+    let g = AWAY.lock().unwrap();
+    if let Some(&at) = g.as_ref().and_then(|a| a.page.get(&page)) {
+        return Some(at);
+    }
+    page_home(page).filter(|&h| committed_page(h))
+}
+
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
     if num.is_null() || arr.is_null() || *num == 0 {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1046,6 +1078,10 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
             }
+        }
+        if !away.ghost.is_empty() {
+            let freed: std::collections::HashSet<usize> = (0..n).map(|i| *arr.add(i)).collect();
+            away.ghost.retain(|_, p| !freed.contains(p));
         }
     }
     let mut g = PHYS_BLOCKS.lock().unwrap();
@@ -1115,6 +1151,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
                 unmap_away(away, at);
+                away.ghost.insert(at, p);
             }
         }
         return home as *mut c_void;
@@ -1128,11 +1165,14 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
         unmap_away(away, at);
+        // (the address gets another page, or none: it is no view of an earlier one any more)
+        away.ghost.remove(&at);
         if p == 0 {
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
             unmap_away(away, old);
+            away.ghost.insert(old, p);
         }
         let fresh = !in_uma(at) && !committed_page(at);
         if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
@@ -1880,6 +1920,50 @@ mod tests {
             let q = VirtualAlloc(std::ptr::null(), 0x30_0000, 0x2000_3000, 4) as usize;
             assert!(q != 0 && !u.contains(q) && !u.is_sparse(q));
             assert_eq!(VirtualFree(q as *mut c_void, 0, mem::MEM_RELEASE), 1);
+        }
+    }
+
+    /// A page the title maps at a second address is found by the first one too (a page pool
+    /// maps its pages at the pool's address, then one at a time where they are used: the GPU's
+    /// page mappings name them by their place in the pool).
+    #[test]
+    fn a_page_is_found_by_an_earlier_view() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return;
+            }
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let pool = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let cpu = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 2, 0, 4, pages.as_mut_ptr()) as usize, pool);
+            assert_eq!(page_of_view(pool + PHYS_PAGE + 0x123), Some(pages[1]));
+            assert_eq!(page_address(pages[1]), Some(pool + PHYS_PAGE));
+            // the second page where it is used: the pool's address still names it
+            let mut one = [pages[1]];
+            assert_eq!(MapTitlePhysicalPages(cpu as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, cpu);
+            *(cpu as *mut u32) = 0xB1_4B00;
+            assert_eq!(page_of_view(pool + PHYS_PAGE), Some(pages[1]));
+            assert_eq!((page_at(cpu), page_at(pool + PHYS_PAGE)), (Some(pages[1]), None));
+            assert_eq!(page_address(pages[1]), Some(cpu));
+            assert_eq!(page_of_view(pool), Some(pages[0]));
+            // unmapped at the address it is used at: at home, still found by the pool's address
+            let mut none = [0usize];
+            assert_eq!(MapTitlePhysicalPages(cpu as *mut c_void, 1, 0, 4, none.as_mut_ptr()) as usize, cpu);
+            assert_eq!(page_of_view(cpu), None);
+            let home = page_address(pages[1]).unwrap();
+            assert_eq!(*(home as *const u32), 0xB1_4B00);
+            assert_eq!(page_of_view(pool + PHYS_PAGE), Some(pages[1]));
+            // another page at the pool's address: that one
+            let mut other = [pages[0]];
+            assert_eq!(MapTitlePhysicalPages((pool + PHYS_PAGE) as *mut c_void, 1, 0, 4, other.as_mut_ptr()) as usize, pool + PHYS_PAGE);
+            assert_eq!(page_of_view(pool + PHYS_PAGE), Some(pages[0]));
+            assert_eq!(page_of_view(pool), Some(pages[0]), "and its earlier address");
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            assert_eq!((page_of_view(pool), page_of_view(pool + PHYS_PAGE)), (None, None), "freed pages are at no address");
+            mem::VirtualFree(pool as *mut c_void, 0, mem::MEM_RELEASE);
+            mem::VirtualFree(cpu as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 

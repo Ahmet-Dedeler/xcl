@@ -204,6 +204,26 @@ fn stub_for(key: &str, fallback_dll: Option<&str>, what: &ImportName) -> (usize,
     (stubs::make_stub(key, &name, ret), Source::Stub)
 }
 
+/// What an import of a function of a DLL shipped with the game binds to: the function at `a`,
+/// or XCL's wrapper around it (the Bink player's decode calls, `hle::bink` – what they write
+/// into the title's frame buffers has to reach the GPU). `XCL_BINK_WRAP=0`: the functions
+/// themselves.
+fn game_dll_import(key: &str, what: &ImportName, a: usize) -> usize {
+    if bink_wrapped(key) {
+        if let ImportName::Name { name, .. } = what {
+            if let Some(w) = crate::hle::bink::wrap(name, a) {
+                return w;
+            }
+        }
+    }
+    a
+}
+
+fn bink_wrapped(key: &str) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    key.starts_with("bink2") && *ON.get_or_init(|| std::env::var("XCL_BINK_WRAP").map_or(true, |v| v.trim() != "0"))
+}
+
 fn resolve_inner(key: &str, what: &ImportName, depth: u32) -> (usize, Source) {
     resolve_inner_opt(key, what, depth, true).expect("allow_stub=true always resolves")
 }
@@ -233,7 +253,7 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
     // DLL shipped with the game → our loader
     if let Some(m) = modules::find_mapped_by_name(key) {
         if let Some(a) = resolve_export_of_mapped_inner(&m, what, depth, allow_stub) {
-            return Some((a, Source::GameDll(key.to_string())));
+            return Some((game_dll_import(key, what, a), Source::GameDll(key.to_string())));
         }
         return allow_stub.then(|| stub_for(key, None, what));
     }
@@ -241,7 +261,7 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
         match crate::loader::load_game_dll(&path) {
             Ok(m) => {
                 if let Some(a) = resolve_export_of_mapped_inner(&m, what, depth, allow_stub) {
-                    return Some((a, Source::GameDll(key.to_string())));
+                    return Some((game_dll_import(key, what, a), Source::GameDll(key.to_string())));
                 }
                 return allow_stub.then(|| stub_for(key, None, what));
             }

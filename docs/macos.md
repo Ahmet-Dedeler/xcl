@@ -9,12 +9,12 @@ port in progress on top of upstream `956a476`, not a supported platform.
 Tested on one machine: MacBook Pro (M5 Max, 64 GB), macOS 27.3, CrossOver 26.3.
 
 - The newer retail game from the README table starts, reaches a steady 30 fps and shows its
-  account prompt and first-run menus with complete text. An intro video fix exists on a
-  separate branch.
+  account prompt, its intro video (30 fps once the front end has loaded) and its first-run
+  menus with complete text, icons and background artwork.
 - After the legal-terms screen the title queues tens of thousands of pipelines and the process
   grows to about 38 GB. Upstream's lazy pipeline building should fix that; this branch predates it.
 - Stencil is lost: depth + stencil buffers are created depth-only (see below).
-- Some pipelines fail to compile in D3DMetal ("Failed to compile fragment function") and are skipped.
+- Textures in BCPack are refused (no exact decoder yet); the front end does not need them.
 
 ## What the port changes
 
@@ -30,6 +30,12 @@ Tested on one machine: MacBook Pro (M5 Max, 64 GB), macOS 27.3, CrossOver 26.3.
 - **Depth formats.** Metal makes no depth-only view of a depth + stencil texture and aborts
   the process instead of returning an error. On a native host every depth + stencil family
   becomes the depth-only R32 family (`XCL_DEPTH_STENCIL=1` restores the Windows mapping).
+- **The GPU's view of the page pool.** The title places textures at addresses only the GPU
+  uses and declares their pages with command queue #31 (newer layout). Those mappings are kept
+  and title textures read through them; planes a title's Bink decoder writes are uploaded after
+  each decode.
+- **Stand-in pixel shaders** write both dual-source colours: D3DMetal refuses a one-colour
+  shader in a pipeline that blends with a SRC1 factor.
 - **Instructions Rosetta 2 does not run:** INSERTQ, CLZERO, MONITORX/MWAITX, ADX, RDSEED,
   MOVNTSS/SD and CLWB are emulated or redirected (`isa.rs`, `eh.rs`).
 - **The title's stall watchdog** fires when the host is slow for a moment; its deliberate

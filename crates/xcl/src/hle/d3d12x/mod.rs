@@ -18,6 +18,7 @@ pub mod dxgi_device;
 mod cpu_writes;
 mod fence_x;
 pub mod frame;
+pub mod gpu_views;
 pub mod guard;
 pub mod layout;
 mod list_layout;

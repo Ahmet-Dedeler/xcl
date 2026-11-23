@@ -1491,6 +1491,25 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
     let hr = f(this, sub, range, data);
+    if crate::hle::bink::trace() {
+        // `XCL_TRACE_VIDEO`: the title's Maps of resources outside unified memory (a texture
+        // lock is one) – what the PC gave, and where the title has the resource
+        static N: AtomicU64 = AtomicU64::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed);
+        if k < 24 || crate::hle::gameinput::any_press() && k < 4096 {
+            let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
+            crate::xlog_info!(
+                "video trace: Map #{k} (subresource {sub}) of {this:p} {:?}: the PC's Map {:#x} → {:#x}; title texture at {:x?}, video-memory texture for {:x?}, own resource for {:x?}; frame {}",
+                d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0)),
+                hr as u32,
+                if hr >= 0 && !data.is_null() { *data as usize } else { 0 },
+                super::title_textures::address(this as usize),
+                super::vram::address(this as usize),
+                TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied()),
+                super::present::counters().1
+            );
+        }
+    }
     if hr >= 0 {
         return hr;
     }
@@ -1541,6 +1560,12 @@ static TITLE_ADDRESS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 /// The title address a resource stands for (buffers in unified memory, placed resources).
 pub(super) fn title_address(res: usize) -> Option<usize> {
     console_buffer(res).map(|b| b.0).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()))
+}
+
+/// The resources of their own whose title address is in `[lo, hi)` (resource, address) – the
+/// traces.
+pub(super) fn title_addresses_in(lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    TITLE_ADDRESS.lock().unwrap().as_ref().map(|m| m.iter().filter(|(_, &a)| a >= lo && a < hi).map(|(&r, &a)| (r, a)).collect()).unwrap_or_default()
 }
 
 pub(super) fn note_title_address(res: usize, va: usize) {
@@ -4541,6 +4566,14 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        // the newer layout's #31: UpdatePageMappings(batch count, batches, page pool address, a
+        // count, 0) – which pool pages the GPU sees at the addresses a title places its pool's
+        // resources at (`gpu_views`; as a stub every texture there read as zeros: a retail
+        // game's streamed textures and the planes of its videos)
+        29 if shifted => {
+            super::gpu_views::update(a1 as u32, a2 as *const u8, a3, a4 as u32);
+            0
+        }
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -4678,28 +4711,6 @@ unsafe fn q_execute_command_lists_x(this: *mut c_void, n: u32, lists: *const *mu
     if !kept.is_empty() {
         q_execute_command_lists(this, kept.len() as u32, kept.as_ptr());
     }
-}
-
-/// command queue #31 of the newer layout (batch count, batches, page pool address, u32, 0): a
-/// retail game calls it on its page pool's copy queue right after
-/// XMemMapPhysicalPagesScatter, with what it just mapped – batches { address, range count,
-/// ranges } of ranges { 1 = mapped / 2 = unmapped, pool page, page count } (64 KiB pages):
-/// the GPU's page tables follow the CPU's. XCL has no GPU page table of its own for pool
-/// pages (RegisterPagePoolX only notes the pool), so there is nothing to update; the result
-/// is not checked. (This is where streamed texture pages change hands.)
-unsafe fn q_update_page_mappings_x(n: u32, batches: *const u8, pool: u64, arg: u32) {
-    static CALLS: AtomicU64 = AtomicU64::new(0);
-    if CALLS.fetch_add(1, Ordering::Relaxed) != 0 {
-        return;
-    }
-    let first = if n != 0 && crate::gpu::shader::readable(batches as usize, 0x18) {
-        let (va, ranges, p) = ((batches as *const u64).read_unaligned(), (batches.add(8) as *const u32).read_unaligned(), (batches.add(0x10) as *const usize).read_unaligned());
-        let range = if ranges != 0 && crate::gpu::shader::readable(p, 12) { (p as *const [u32; 3]).read_unaligned() } else { [0; 3] };
-        format!("first batch: address {va:#x}, {ranges} range(s), first {{ flags {}, pool page {:#x}, {} page(s) }}", range[0], range[1], range[2])
-    } else {
-        String::from("no readable batch")
-    };
-    crate::xlog_info!("D3D12.X: command queue #31 (page mappings of pool {pool:#x}: {n} batch(es), {arg:#x}) – XCL keeps no GPU page table for pool pages; not done ({first})");
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code

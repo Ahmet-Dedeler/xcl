@@ -1868,3 +1868,87 @@ Little is left to do without the exe – the rest needs an actual run of the gam
   after the first gamepad press; no GPU work of its own), `XCL_TRANSLATED_IDENT=<hex>` (builds that differ outside
   the translator share the translation cache: a new build's first run otherwise translates ~1 500 programs again,
   four minutes on this host). Run with `keyboard_mouse = false` in xcl.toml when someone else types on the machine.
+
+## The intro video shows pictures (lane video, 2026-11-24; D3DMetal, 15 live runs)
+- **What the video is:** CPU Bink. The exe imports `BinkRegisterFrameBuffers` / `BinkDoFrameAsyncMulti` /
+  `BinkDoFrameAsyncWait` and none of Bink's GPU-buffer calls; its player (image +0x442f760) locks its plane textures
+  once (+0x5121690: `Map`, then an address in the range at +0x9e1dad0 is rebased to the one at +0x9e1dac0) and hands
+  the pointers to Bink, which writes them every frame. The planes are nine R8 title textures made before sign-in
+  (three buffers of 3840x2160 + 2 x 1920x1080, pitch 3840 / 2048, console flags 0, kept in step by `title_textures`).
+- **Why they read as zeros:** the title's resource memory is a page pool with two address ranges of 24 GiB
+  (+0x1e6c110; seen: CPU range 0x720000000, GPU range 0x7000000000, pool of 99,776 pages registered at 0xd20000000):
+  pages are mapped for the CPU with `XMemMapPhysicalPagesScatter` in one, and for the GPU with command queue #31 of
+  the newer layout in the other (+0xf2c560: the same virtual page number in both), and resources are placed in the
+  GPU's range. Queue #31 went to the queue's stub (its handler had lost its dispatch arm), so nothing was ever at
+  the addresses the textures are placed at (reserved, never committed): every texture of the pool uploaded zeros,
+  and Bink's planes, written at 0xb6f000000 …, were never looked at.
+- **Fix 1, queue #31** (`d3d12x::gpu_views`): the call's mappings are kept – GPU-view page → physical page, named
+  by its place in the pool through `kernelx::page_of_view` (a page the title maps at a second address is still
+  found by the first: `Away::ghost`); `title_textures::read_committed` reads a texture's unreadable pages where
+  the CPU has them. Arguments and structures: the doc of `gpu_views::update`.
+- **Fix 2, the decoder's writes** (`hle::bink`, `title_textures::note_cpu_write`): the title's imports of the Bink
+  DLL are wrapped (`resolver::game_dll_import`); after each decode the planes of the current buffer (`FrameNum` of
+  the title's registered structure – the DLL's `BinkGetFrameBuffersInfo` gives 0 there) are noted, and the textures
+  over that memory or over its GPU views are uploaded before the title's next submit. A texture that is one linear
+  level goes row by row from the title's memory into a staging buffer kept for it (`upload_rows`).
+- **Not only a mirror:** with `XCL_TRACE_PAGE_VIEWS=1`, after 65 calls of queue #31 (loading screens) 4,793 pages
+  had been mapped and 952 unmapped; 4,092 were at GPU address = CPU address + 0x68e0000000 (the ranges' starts
+  apart) when the call came, 701 at 16 other distances – pages not mapped in the CPU's range, still at their place
+  in the pool (0xd20000000 + k * 64 KiB). Upstream PR #283 pairs the two reservations by offset: enough for the
+  video's planes and every texture the CPU writes through its range, nothing for those 701 pages (the loading
+  screens' artwork shows here; the front end's setup pages were not captured with this build).
+- **Measured** (one run, the two ways alternating, quiet machine): 5.7 ms a plane as every upload (17 ms a 4K
+  frame; the video then ran at 15 - 20 fps), 0.8 ms by rows (2.4 ms a frame: 1.1 ms copying, 1.3 ms the list and
+  the wait); with rows only, 30.0 fps over the video's frames 1788 - 1968 (decodes #240 - #420 two seconds apart).
+  Asking Windows about an address in the 24 GiB reservation takes ~0.2 ms under Wine: `TitleMemory` keeps what it
+  found (a first version asked once a row: 47 ms a frame).
+- Switches: `XCL_BINK_WRAP=0`, `XCL_BINK_PLANES=all`, `XCL_TITLE_ROW_UPLOADS=0` / `ab`, `XCL_TRACE_VIDEO=1`, `XCL_TRACE_PAGE_VIEWS=1`,
+  `XCL_PRESS_AFTER_PICTURE=s:BUTTON` (presses counted from the first dumped frame with a picture: the loading stage
+  takes 100 - 215 s depending on what else runs), `XCL_FRAME_DUMP_FROM=n`, `XCL_TRANSLATED_IDENT` (lane text's).
+- Seen on the way: a run stopped presenting at frame ~450 with frame dumps on (as the black-frames lane saw at 470);
+  the gamepad of another running copy's user reaches every copy (buttons 0x80 / 0x40 arrived unscripted); dead code
+  left by the rebase next to queue #31's handler: `q_execute_command_lists_x`, `list_layout::for_queue`,
+  `list_x::queue_type`, `NEWER_LIST_SLOTS` (queue #35's filter of lists by queue type is not in effect).
+- Open: textures of the pool that the title fills later without a call XCL sees (DirectStorage into the CPU's
+  range) are uploaded once, when they are made – they need `note_cpu_write` from DirectStorage, or lane text's
+  content comparison reading through `read_committed`. The row upload still waits for the GPU on XCL's queue each
+  time (1.3 ms): recording it on the title's queue would drop the wait.
+
+## mac3 and lane-video together (branch mac3-video, 2026-11-24; D3DMetal, 1 live run)
+- **What is merged:** lane-video's three commits (GPU views of a page pool, Bink planes uploaded after each decode,
+  the run switches) into mac3 (content comparison of unwatched title textures, remote input, background keyboard),
+  then mac3's `d4475b0` (stand-in pixel shaders write both dual-source colours).
+- **How the two texture paths work together** (`title_textures`):
+  - `content_hash` reads the bytes an upload reads (`TitleMemory::locate`, a 64 KiB page at a time through
+    `gpu_views::memory_at` – no fixed distance between the GPU's range and the CPU's): a texture placed in the GPU's
+    range is compared where the CPU has its pages, so one whose pages are filled or mapped after it was made goes
+    up again (before: it hashed as "nothing there" for good and was uploaded once). One `TitleMemory` a look.
+  - A texture whose writer tells XCL (`note_cpu_write`: Bink's planes) is `told` from then on and left out of the
+    comparison for good: it goes up by rows when told and only then. Nothing hashes a 4K frame's planes.
+  - A page pool's texture that changed is compared once a frame (not before every submit) and returns to its turn
+    60 frames after its last change (`POOL_FRAMES`): streaming writes a few times, then never. Textures at title
+    addresses (the glyph cache) are compared exactly as on mac3.
+  - Textures inside the range of GPU views count as not write-watched (`gpu_views::in_range`, asked when the
+    texture is made: not checked on a host where that range is write-watched).
+  - `refresh_once`: `poll_unwatched`, then pending / dirty / told textures; told ones by rows first; a texture in
+    more than one list goes once.
+- **Seen in one run** (fresh settings, `XCL_FRAME_DUMP=30`, `XCL_TRACE_VIDEO=1`, driven through `XCL_REMOTE_INPUT`;
+  other lanes' builds were compiling beside it): sign-in bar; the intro video as pictures (Bink decodes 120 → 420
+  in 10.5 s: 24, 29.5, 29.6, 30.5, 30.0 fps a 60 decodes; the first 120 decodes took 8.7 s while the front end
+  loaded – lane-video's r12 took 11 s there); NAVIGATION EXPERIENCE, UI TEXT SIZE and SUBTITLES with complete text
+  and both selector arrows; BRIGHTNESS with its symbol; FINISH SETUP? and LEGAL NOTICES with their background
+  artwork; 30.0 fps on every page. No "Failed to compile fragment function" line (40 before `d4475b0`).
+- **What keeping title textures in step cost** (the frame-rate line is now followed by `title textures over the
+  last 300 frames: …`, `title_textures::cost_since_last`; 3 looks a frame):
+  - front-end pages: 25 MiB compared a frame in 2.3 – 4.2 ms (0.8 – 1.4 ms a look), 0 – 2 uploads of 4 MiB (the
+    glyph cache) per 300 frames in 5 – 17 ms;
+  - the video once the front end is loaded: 2.8 ms a frame comparing, 0.6 ms an uploaded plane by rows (1260 planes
+    in 787 ms: 306 ms copying rows, 467 ms the list and the wait) – 1.9 ms a video frame;
+  - while the front end loads under the video's first seconds: 44 MiB compared a frame at 2.4 GB/s (11 GB/s when
+    nothing else runs), 18.8 ms a frame over those 300 frames (20.0 fps; 37 textures changed and went up again –
+    the ones lane-video uploaded once); the loading stage before the sign-in screen had one such stretch too
+    (frames 1200 – 1500: 20 ms a frame at 1.1 GB/s, 13.6 fps – lane-video alone showed 7 – 10 fps there).
+- Open: why the comparison is 5 – 10 times slower while the title loads (other threads' work, or waiting for the
+  kernel's page table lock in `kernelx::page_address` – once per 64 KiB page – while the title maps pages; not
+  measured apart); a texture of the pool whose pages change more than 60 frames after its last change is found in
+  its turn (up to ~160 frames).

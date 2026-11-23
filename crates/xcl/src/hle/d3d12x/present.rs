@@ -67,6 +67,8 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         let now = std::time::Instant::now();
         if let Some(t) = LAST.lock().unwrap().replace(now) {
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
+            // what keeping title textures in step with the title's memory took in those frames
+            crate::xlog_info!("D3D12.X: title textures over the last 300 frames: {}", super::title_textures::cost_since_last());
         }
     }
     super::real::stop_if_device_removed();
@@ -133,6 +135,18 @@ thread_local! {
 fn now_ms() -> u64 {
     static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     T0.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// when the first dumped frame with a picture was seen (ms of `log::uptime`, 0: none yet)
+static FIRST_PICTURE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Seconds (of `log::uptime`) at which a dumped frame (`XCL_FRAME_DUMP`) first was mostly not
+/// black – a title's loading stage is over.
+pub fn first_picture() -> Option<f64> {
+    match FIRST_PICTURE_MS.load(Ordering::Relaxed) {
+        0 => None,
+        ms => Some(ms as f64 / 1000.0),
+    }
 }
 
 pub fn counters() -> (u64, u64) {
@@ -744,9 +758,14 @@ fn frame_dump_due() -> bool {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
+    // `XCL_FRAME_DUMP_FROM=n`: none before the n-th frame (a dump while a retail game loads
+    // has stopped its frames twice, at frames 470 and ~450 – not diagnosed; its first picture
+    // comes after frame 1500)
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let from = *FROM.get_or_init(|| std::env::var("XCL_FRAME_DUMP_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
     // the first frames too: a title under bring-up may never reach its 20th
     let n = PRESENTS.load(Ordering::Relaxed);
-    every > 0 && (n < 4 || n % every == 20.min(every - 1))
+    every > 0 && n >= from && (n < 4 || n % every == 20.min(every - 1))
 }
 
 /// Frames shown so far.
@@ -907,6 +926,12 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
     rb.Unmap(0, None);
     let n = PRESENTS.load(Ordering::Relaxed);
+    // the first dumped frame that is mostly not black: the title shows something
+    // (`XCL_PRESS_AFTER_PICTURE` counts from here)
+    if lit * 2 > (w as usize / step) * (h as usize / step) && FIRST_PICTURE_MS.load(Ordering::Relaxed) == 0 {
+        FIRST_PICTURE_MS.store((crate::log::uptime() * 1000.0) as u64 | 1, Ordering::Relaxed);
+        crate::xlog_info!("present: frame {n} is the first dumped frame with a picture");
+    }
     let Some(boot) = crate::state::boot() else { return };
     let path = boot.logs_dir().join(format!("{tag}_{n}.bmp"));
     let _ = std::fs::write(&path, &bmp);
