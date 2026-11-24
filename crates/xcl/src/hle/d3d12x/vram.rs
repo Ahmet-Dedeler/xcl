@@ -875,6 +875,13 @@ mod tests {
                 };
                 let mut r: Option<ID3D12Resource> = None;
                 let made = dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_ok() && r.is_some();
+                // (Apple's D3DMetal reports no TILED support for a format it makes reserved textures
+                // of – R32_TYPELESS: what `reservable` turns away there the driver would have made.
+                // Reserved targets are not used on that host, `on_pages`.)
+                if crate::util::mac_host() && made && !reservable(&dev, &desc) {
+                    println!("SKIPPED reservable_agrees_with_the_driver, format {} x{samples}: this host makes it but reports no tiled support", format.0);
+                    continue;
+                }
                 assert_eq!(reservable(&dev, &desc), made, "format {} x{samples}: reservable vs CreateReservedResource", format.0);
             }
         }
