@@ -188,6 +188,25 @@ pub fn install_crash_handler() {
                 }
             });
         }
+        // `XCL_DUMP_THREADS_ON=<file>`: the same each time that file is written (its time
+        // changes) – for a stall whose time is not known beforehand; what is in the file is
+        // logged with the dump
+        if let Ok(path) = std::env::var("XCL_DUMP_THREADS_ON") {
+            let _ = std::thread::Builder::new().name("xcl-thread-dump".into()).spawn(move || {
+                let modified = |p: &str| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                let mut seen = modified(&path);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let now = modified(&path);
+                    if now.is_some() && now != seen {
+                        seen = now;
+                        crate::xlog_info!("thread stacks {:.1} s into the run (XCL_DUMP_THREADS_ON: {}):", crate::log::uptime(), std::fs::read_to_string(&path).unwrap_or_default().trim());
+                        dump_threads();
+                        crate::log::flush();
+                    }
+                }
+            });
+        }
         // `XCL_CRASH_AT=<seconds>`: a deliberate access violation on a thread of XCL's at that
         // time – to see what the title's crash handling does with it (its reporter's upload
         // has to fail in `hle::netoff`, not at a name server)
