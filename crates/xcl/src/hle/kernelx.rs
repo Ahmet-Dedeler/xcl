@@ -369,7 +369,7 @@ unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
 /// and Wine keeps a write watch by protecting pages: Rosetta cannot resume such a store after
 /// its fault (as with `coherent_heaps`). Textures there are compared by content instead
 /// (`title_textures::poll_unwatched`); a GPU view is still paired with its CPU view (`mirrors`).
-fn watched_fallback() -> bool {
+pub(crate) fn watched_fallback() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("XCL_WATCHED_FALLBACK") {
         Ok(v) => v.trim() != "0",
