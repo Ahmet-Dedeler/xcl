@@ -667,7 +667,7 @@ fn tier2(dev: &ID3D12Device) -> bool {
 /// do not show each other's contents there (measured: 512 of 512 rows differ), and what Metal
 /// cannot make is not an error code: the process ends on an assertion. Arenas (placed resources
 /// in heaps) and committed textures are known to work.
-fn on_pages() -> bool {
+pub(super) fn on_pages() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("XCL_VRAM_ARENAS") {
         Ok(v) => v.trim() == "0",

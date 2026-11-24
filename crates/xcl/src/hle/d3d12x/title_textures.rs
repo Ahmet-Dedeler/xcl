@@ -1778,7 +1778,8 @@ mod tests {
             assert_ne!(at, 0, "reserve-only fallback must succeed");
             let reservation = Reservation(at);
             assert!(!crate::gpu::uma::get().unwrap().contains(at), "exercise the Windows fallback");
-            assert!(kernelx::in_graphics_reservation(at), "fallback must be write-watched");
+            // (where the fallback is write-watched at all: not on a Mac, `kernelx::watched_fallback`)
+            assert!(kernelx::in_graphics_reservation(at) || !kernelx::watched_fallback(), "fallback must be write-watched");
             reservation
         }
         unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
@@ -1854,7 +1855,10 @@ mod tests {
             assert!(kernelx::physical_page_at(va));
             let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             assert_ne!(mem::VirtualQuery(va as *const c_void, &mut info, std::mem::size_of_val(&info)), 0);
-            assert_eq!(info.State, mem::MEM_RESERVE, "exercise the lazy mapping before its first touch");
+            // (where pages are committed on first use: not on a Mac, `kernelx::lazy::enabled`)
+            if kernelx::lazy::enabled() {
+                assert_eq!(info.State, mem::MEM_RESERVE, "exercise the lazy mapping before its first touch");
+            }
             assert_eq!(mirror_source(va), va, "a mapped lazy page overrides the CPU mirror");
             refresh(queue.as_raw());
             assert_eq!(read_r8(dev, &queue, &texture), vec![0; 64 * 64], "the untouched physical page supplies zeros");
@@ -2408,6 +2412,10 @@ mod tests {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: no UMA");
                 return;
             };
+            if !super::super::vram::on_pages() {
+                println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: title textures are not on shared pages on this host (XCL_VRAM_ARENAS)");
+                return;
+            }
             let pool_size = 16usize << 20;
             let Some(base) = uma.alloc(pool_size, 0x1_0000).map(|p| p as usize) else {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: UMA alloc failed");
