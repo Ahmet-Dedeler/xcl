@@ -2082,3 +2082,62 @@ libopus at run time, the cross-build needs nothing new).
   cpu_writes, vram, sparse}`, `hle::kernelx`, `gpu::shader::tests`, `isa`, `insn`, `gpu::tiling`, `gpu::uma`,
   the stand-in test): 91 passed on 7ebf1b8 (90 on a6f5f7a, one and four at a time). `hle::d3d12x::list_x`'s GPU tests hang on this host
   (not looked at); three of upstream's tests state what this host does not have and skip or relax that part.
+
+## Masked stores under Rosetta 2 (branch `mac6`, 2026-11-24; 5 live runs, bottle `xcl-gta6`)
+`mac5` plus three commits: `maskmov` (decoder, helpers, site finder), the loader step, `XCL_FRAME_DUMP_FROM`.
+- **The diagnosis, corrected.** Not "a masked store that faults cannot be resumed": Rosetta 2 runs VMASKMOVPS / PD and
+  VPMASKMOVD / Q to memory an element at a time and resumes a fault on element 0; a fault on any later element ends
+  the process ("unexpectedly need to EmulateForward on a synchronous exception", `inst_index` past the first store).
+  Measured natively (x86-64 program under Rosetta, macOS 27.3: read-only page, SIGSEGV handler that makes it
+  writable – 86 of 86 stores whose first faulting element is not element 0 end the process, every one whose
+  element 0 faults is resumed; VMOVDQU across the same boundary, REP STOS / MOVS, MASKMOVDQU and masked loads are
+  resumed; VPGATHERDD is not, but the title has no gather) and under CrossOver (`maskmov`'s ignored test
+  `the_instruction_itself_across_a_watched_page_boundary`: first element on a watched page resumed, fourth element
+  – "rosetta error …"). So the store that kills is the one that starts on a page already written and goes on into
+  one still protected by the write watch: any page boundary inside a buffer the title fills this way.
+- **The remedy** (`maskmov.rs`, `loader::replace_masked_stores`; `XCL_MASKED_STORES=1` / `0`, default: only under
+  Rosetta, `util::rosetta` = CPUID brand "VirtualApple …"; never on a CPU). At image load (after relocation, before
+  protection) each store becomes `call helper` + NOPs; a helper takes the address into R8, spills source and mask
+  to its stack and stores the selected elements with plain `mov`s (CDQ / JRCXZ: no flag written, no vector register
+  written, a masked-out element not touched). Helpers sit right behind the image with unwind data.
+  game_scarlett_master.exe (mapped at 0x8ab0000 here: XCL's own exe has 0x140000000): 1,130 stores (789 VPMASKMOVD,
+  160 VPMASKMOVQ, 180 VMASKMOVPS, 1 VMASKMOVPD; 37 RIP-relative, 25 RSP-relative, 6 XMM) → 465 helpers, 67 ms;
+  1,125 found from their function's start in the unwind data, 5 in leaf functions (walked to from the end of the
+  function before); none skipped. libhttpclient.gdk.dll: 4, all in a leaf function (the C++ library's vectorised
+  `replace`). Checked offline against the real image: `insn_len` = Capstone on 22.4 million instructions of all
+  299,257 functions (six with data in code stop both), every site's decoded operand = LLVM's disassembly.
+- **Tests** (under Wine in the bottle, `maskmov` + `loader::tests::masked_stores_…`): 8 passed, 1 ignored (the
+  finding). Helper against instruction: 224 stores (4 kinds × YMM / XMM × 28 operand shapes), every mask, 32,704
+  runs – registers, flags, YMM0–15, stack and memory identical and memory as defined; masked-out tail at the end
+  of a mapping; a store across a writable and a read-only / write-watched page completed after its fault;
+  RtlVirtualUnwind from a fault in a helper gives the store's frame.
+- **Live.** m1 (fresh profile, first-run pages): 30.0 fps to frame 2400, no exception. l1, l2 (accepted profile):
+  loading passes the old stop (42 – 55 s after the video's A) and runs 170 – 175 s past it; c1, the same build
+  with `XCL_MASKED_STORES=0`: "rosetta error …" at x86_rip 0x8b29d67 = image +0x79d67, `inst_index` 22 of 35,
+  ~50 s after the A. Presents per 2 s in l1 from the A: 60 for ~25 s, then 2 – 25 with stretches of 0 while
+  DirectStorage streams (85,168 requests, 5.06 GB, 6,021 failed in l1; 84,965 / 5.02 GB / 4,330 in l2 – BCPack
+  refusals, 2,048+; also 8 "DirectStorage: access violation … (a page array)" and 7 "could not be written to its
+  page(s) – the first: 0x0: not a page number" a run). Frame-rate lines: 24.7, 25.4, 23.4, then 5.9 and 4.5 fps per
+  300 frames. Memory: system free from 73 % to 25 % (wired 34 GB) by 210 s; video memory 4.1 GB local at most;
+  the DXC gate held compiles back 4 times.
+- **What stops it now** (l1 and l2 alike): the title's second watchdog, "unhandled exception 0xc0000005 in
+  game_scarlett_master.exe+0x23cf683 (write at address 0x0)", after 32 s without a present. In those 32 s the
+  title creates compute pipelines on four threads of its own (`real::build_compute` → `translated_compute_pso` →
+  `console_to_dxil` → `dxc::compile`, four `xcl-dxc-*` threads inside dxcompiler.dll) while its main thread
+  waits at +0x23cf735: 132 "compute PSO with the translated console CS" in l1, 241 in l2 (90 in the first 2 s
+  from the cache, then 3 – 31 per 2 s). Each run gets a cache's worth further; no "Failed to compile" /
+  "marking PSO" / GPU hang in the unified log for l1. List #101 was called 12 times (stub) before that.
+  The kernelx page-map lock is still what holds presents down while streaming (l1 dump at 156.7 s: Scatter →
+  `map_pages` → `unmap_away` copying, the render thread in `refresh` → `gpu_views::lookup` → `page_address`
+  waiting) but it is not what ends the run; not changed.
+- **Not done.** `XCL_WATCHED_FALLBACK=1` and `XCL_COHERENT_HEAPS=1` were not tried with the helpers (the two
+  experiments were next; the defaults are unchanged). The re-entrant-release deadlock in `sparse::forget_buffer`
+  (prs lane, `exp/s6-fix` 1bd7af2; upstream PR #443 is a different hang, `sparse::init`) is not on this branch:
+  none of the 11 thread dumps of l1 / l2 / c1 has `forget_buffer` or `res_release` in it and no run stopped
+  presenting 10 – 18 s after its first frame (all with `XCL_ACTIVITY=1`), but it is not fixed here. Window
+  captures were impossible or flat grey (the screen was locked), so the pictures are frame dumps: m2 (fresh
+  profile, `XCL_FRAME_DUMP=60 XCL_FRAME_DUMP_FROM=1100`, 23 dumps, no hang at a dump) has the intro video's
+  frames and the first-run pages with complete text and button prompts (BRIGHTNESS with its symbol) at
+  26 – 30 fps per 300 frames; the pages' arrows were not looked at one by one. The loading screen itself was
+  not captured. Run logs and evidence are kept with the run (`run/*.log`, `shots/m2`,
+  `exp/` – the Rosetta fault programs, the offline planner check against Capstone and objdump).
