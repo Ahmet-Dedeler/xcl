@@ -100,7 +100,27 @@ const IDLE_WAIT: Duration = Duration::from_micros(300);
 /// frees the memory under a resource right after its last `Release` finds it unpinned, as
 /// before. Otherwise the thread here lets it go.
 pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
+    // A Release can come from inside a call into the host made further up this thread's stack
+    // (Apple's D3DMetal lets go of its own references through the object's table on the calling
+    // thread) – `drain`'s Signal among them, with the lock here held: never wait for it. What
+    // could not be noted is noted by the lock's next holder (`drain_known`).
+    // On such a host (its D3D12 in no PE module) nothing else is done on this thread either: the
+    // queues are not asked from inside a call the host is in the middle of, and no heap over
+    // the title's memory waits for the resource there (no OpenExistingHeapFromAddress).
+    if crate::gpu::shader::NATIVE_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed) {
+        LATE.lock().unwrap().push(res);
+        start_thread();
+        return;
+    }
+    match HELD.try_lock() {
+        Ok(mut g) => g.get_or_insert_with(Held::default).open.push(res),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            LATE.lock().unwrap().push(res);
+            start_thread();
+            return;
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => return,
+    }
     let start = Instant::now();
     drain_known(true);
     while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
@@ -113,6 +133,13 @@ pub unsafe fn hold(res: usize) {
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
     // resources – unmapping them stood still while one was held "until the next submit").
+    start_thread();
+}
+
+/// resources `hold` could not note because the lock was held (never held across a host call)
+static LATE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn start_thread() {
     static THREAD: std::sync::Once = std::sync::Once::new();
     THREAD.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
@@ -125,8 +152,15 @@ pub unsafe fn hold(res: usize) {
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
-        return;
+    {
+        let mut g = HELD.lock().unwrap();
+        let late = std::mem::take(&mut *LATE.lock().unwrap());
+        if !late.is_empty() {
+            g.get_or_insert_with(Held::default).open.extend(late);
+        }
+        if g.as_ref().is_none_or(Held::is_empty) {
+            return;
+        }
     }
     let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
     for raw in super::present::known_queues() {

@@ -1719,7 +1719,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
-                super::sparse::free(p);
+                super::sparse::free_at_release(p);
             } else {
                 u.free(p);
             }

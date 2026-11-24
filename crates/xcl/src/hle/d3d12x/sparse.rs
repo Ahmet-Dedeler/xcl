@@ -556,7 +556,10 @@ pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &
     if g.is_none() {
         // no sparse window was made (`init`): the copies still need the queue and the lists
         match new_state(dev, Vec::new()) {
-            Ok(s) => *g = Some(s),
+            Ok(s) => {
+                *QUEUE.lock().unwrap() = Some(s.queue.clone());
+                *g = Some(s);
+            }
             Err(e) => {
                 crate::xlog_warn!("shadowed window at {base:#x}: {e}");
                 return false;
@@ -602,6 +605,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
+            *QUEUE.lock().unwrap() = Some(s.queue.clone());
             let old = STATE.lock().unwrap().replace(s);
             drop(old);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
@@ -1256,8 +1260,13 @@ pub unsafe fn free(p: usize) -> bool {
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
 /// The queue tile mappings go out on, once there is one.
 pub fn queue() -> Option<ID3D12CommandQueue> {
-    STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
+    // (not from the state: `late_release` asks from inside a resource's Release, which can come
+    // while this thread holds the state's lock – `forget_buffer`)
+    QUEUE.lock().unwrap().clone()
 }
+
+/// the state's queue, for `queue` (never held across a call into the host but the AddRef)
+static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
@@ -1507,6 +1516,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    s.settle_late();
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();
@@ -1626,24 +1636,115 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
+    // (a buffer released while the state was locked may have had this address)
+    s.settle_late();
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
     s.signal();
     Some((hr, delta))
 }
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
+///
+/// Never waits for the state's lock. A host may release a resource from inside a call XCL makes
+/// with the lock held – Apple's D3DMetal lets go of the references its lists and queues hold
+/// through the object's own table, on the calling thread, when a list of XCL's is reset or
+/// executed (`upload_dirty`, `readback_ranges`) – and the wrapped Release comes here: with a
+/// wait, a retail game's render thread stood in its own lock for good 10 – 18 s after the first
+/// frame. What cannot be forgotten at once is forgotten by the lock's next holder (`settle_late`).
 pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+    match STATE.try_lock() {
+        Ok(mut g) => {
+            if let Some(s) = g.as_mut() {
+                // SAFETY: with the state locked, as its callers below
+                unsafe { s.settle_late() };
+                s.forget(res);
             }
         }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            SEEN.call_once(|| crate::xlog_info!("D3D12.X: a placed buffer was released while the sparse state was locked – forgotten by the lock's next holder"));
+            LATE.lock().unwrap().push(Late::Buffer(res));
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {}
+    }
+}
+
+/// `free` from a resource's last Release (`real::res_release`: a buffer whose memory XCL took
+/// from a sparse window), which must not wait for the state's lock either (`forget_buffer`):
+/// with the lock held elsewhere the block is given back by the lock's next holder.
+pub unsafe fn free_at_release(p: usize) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    if !u.is_sparse(p) || u.sparse_reservation(p).is_none_or(|(start, _)| start != p) {
+        return false;
+    }
+    match STATE.try_lock() {
+        Ok(mut g) => {
+            match g.as_mut() {
+                Some(s) => {
+                    s.settle_late();
+                    s.free_block(p)
+                }
+                None => {
+                    drop(g);
+                    free(p)
+                }
+            }
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            LATE.lock().unwrap().push(Late::Block(p));
+            true
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => false,
+    }
+}
+
+/// What a Release could not do because the state was locked (`forget_buffer`, `free_at_release`).
+enum Late {
+    /// a placed buffer that is gone
+    Buffer(usize),
+    /// a block of a sparse window to give back
+    Block(usize),
+}
+
+/// (never held across a call into the host)
+static LATE: Mutex<Vec<Late>> = Mutex::new(Vec::new());
+
+impl State {
+    /// What Releases left undone while the state was locked, in their order. Called by holders
+    /// of the lock before they look at `buffers` or `pinned`: a new buffer may have the address
+    /// of one that is gone.
+    unsafe fn settle_late(&mut self) {
+        let late = std::mem::take(&mut *LATE.lock().unwrap());
+        for l in late {
+            match l {
+                Late::Buffer(res) => self.forget(res),
+                Late::Block(p) => {
+                    self.free_block(p);
+                }
+            }
+        }
+    }
+
+    fn forget(&mut self, res: usize) {
+        let Some(tiles) = self.buffers.remove(&res) else { return };
+        for tile in tiles {
+            if let Some(c) = self.pinned.get_mut(&tile) {
+                *c -= 1;
+                if *c == 0 {
+                    self.pinned.remove(&tile);
+                    self.release_if_unused(tile);
+                }
+            }
+        }
+    }
+
+    /// `free` with the state locked: decommitted before the address goes back.
+    unsafe fn free_block(&mut self, p: usize) -> bool {
+        let Some(u) = crate::gpu::uma::get() else { return false };
+        let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
+        self.decommit_range(start, len);
+        VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
+        u.sparse_release(p).is_some()
     }
 }
 
