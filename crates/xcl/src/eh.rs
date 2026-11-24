@@ -188,6 +188,14 @@ pub fn install_crash_handler() {
                 }
             });
         }
+        // `XCL_PROBE_MOV=<image offset, hex>[,…]`: see `probe_mov`
+        if let Ok(list) = std::env::var("XCL_PROBE_MOV") {
+            let offsets: Vec<usize> = list.split(',').filter_map(|o| usize::from_str_radix(o.trim().trim_start_matches("0x"), 16).ok()).collect();
+            if !offsets.is_empty() {
+                windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(probe_mov));
+                let _ = std::thread::Builder::new().name("xcl-probe".into()).spawn(move || arm_probes(&offsets));
+            }
+        }
         // `XCL_DUMP_THREADS_ON=<file>`: the same each time that file is written (its time
         // changes) – for a stall whose time is not known beforehand; what is in the file is
         // logged with the dump
@@ -537,6 +545,98 @@ unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostic
 
 /// A call or jump through a null (or near-null) pointer: logged with the return address and
 /// the registers, since the faulting address itself says nothing about the caller.
+/// the probes of `XCL_PROBE_MOV`: (address, the 7 bytes that were there)
+static MOV_PROBES: Mutex<Vec<(usize, [u8; 7])>> = Mutex::new(Vec::new());
+
+/// Waits for the title's image and puts a breakpoint on each `mov r64, [base + disp32]` named
+/// by its offset in the image (REX.W 8B /r with mod 10 and no SIB; anything else is refused).
+unsafe fn arm_probes(offsets: &[usize]) {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let m = loop {
+        match modules::main_module() {
+            Some(m) => break m,
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    for &off in offsets {
+        let at = m.base + off;
+        if !m.contains(at) || !m.contains(at + 6) {
+            continue;
+        }
+        let was = (at as *const [u8; 7]).read_unaligned();
+        if was[0] & 0xFA != 0x48 || was[1] != 0x8B || was[2] >> 6 != 2 || was[2] & 7 == 4 {
+            crate::xlog_warn!("XCL_PROBE_MOV: image +{off:#x} is not mov r64, [base + disp32] ({:02x?}) – not probed", was);
+            continue;
+        }
+        let mut old = 0u32;
+        if VirtualProtect(at as *const c_void, 1, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            continue;
+        }
+        MOV_PROBES.lock().unwrap().push((at, was));
+        (at as *mut u8).write_volatile(0xCC);
+        VirtualProtect(at as *const c_void, 1, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), at as *const c_void, 1);
+        crate::xlog_info!("XCL_PROBE_MOV: image +{off:#x} ({:02x?}) is probed", was);
+    }
+}
+
+/// `XCL_PROBE_MOV`: the breakpoint in place of a `mov r64, [base + disp32]` of the title. XCL
+/// does the load and logs what was loaded and what memory it points to (the first 48 times,
+/// then every 256th) – where a loop writes that the host cannot resume after a fault (under
+/// Rosetta 2 a masked store into write-protected memory ends the process with no exception
+/// for anyone to look at; the pointer is loaded right before such a loop).
+unsafe extern "system" fn probe_mov(info: *mut EXCEPTION_POINTERS) -> i32 {
+    let rec = &*(*info).ExceptionRecord;
+    if rec.ExceptionCode as u32 != 0x8000_0003 {
+        return 0;
+    }
+    let site = rec.ExceptionAddress as usize;
+    let Some(was) = MOV_PROBES.lock().unwrap().iter().find(|p| p.0 == site).map(|p| p.1) else { return 0 };
+    let ctx = &mut *(*info).ContextRecord;
+    let reg = |ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, k: u8| -> *mut u64 {
+        match k {
+            0 => &mut ctx.Rax, 1 => &mut ctx.Rcx, 2 => &mut ctx.Rdx, 3 => &mut ctx.Rbx, 4 => &mut ctx.Rsp, 5 => &mut ctx.Rbp, 6 => &mut ctx.Rsi, 7 => &mut ctx.Rdi,
+            8 => &mut ctx.R8, 9 => &mut ctx.R9, 10 => &mut ctx.R10, 11 => &mut ctx.R11, 12 => &mut ctx.R12, 13 => &mut ctx.R13, 14 => &mut ctx.R14, _ => &mut ctx.R15,
+        }
+    };
+    let (rex, modrm) = (was[0], was[2]);
+    let base = *reg(ctx, (modrm & 7) | (rex & 1) << 3);
+    let ea = base.wrapping_add(i32::from_le_bytes([was[3], was[4], was[5], was[6]]) as i64 as u64) as usize;
+    if !crate::gpu::shader::readable(ea, 8) {
+        return 0;
+    }
+    let value = (ea as *const u64).read_unaligned();
+    *reg(ctx, (modrm >> 3 & 7) | (rex >> 2 & 1) << 3) = value;
+    ctx.Rip = (site + 7) as u64;
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 48 || n % 256 == 0 {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+        let p = value as usize;
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let known = VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0;
+        let uma = crate::gpu::uma::get();
+        let (mut buf, mut count, mut grain) = ([std::ptr::null_mut::<c_void>(); 4], 4usize, 0u32);
+        extern "system" {
+            fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
+        }
+        let watched = GetWriteWatch(0, (p & !0xFFF) as *const c_void, 0x1000, buf.as_mut_ptr(), &mut count, &mut grain) == 0;
+        crate::xlog_info!(
+            "probe #{n} at {}: loaded {value:#x} from {ea:#x}; rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}; that memory: {}unified memory window {:?}{}, {}write-watched{}, allocation {:#x} (protection {:#x}), region {:#x}+{:#x} state {:#x} protection {:#x} type {:#x}",
+            modules::describe_address(site), ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
+            if known { "" } else { "unknown to Windows, " },
+            uma.and_then(|u| u.window_of(p)),
+            if uma.is_some_and(|u| u.is_sparse(p)) { " (sparse)" } else { "" },
+            if watched { "" } else { "not " },
+            if crate::hle::kernelx::in_graphics_reservation(p) { " (a graphics reservation)" } else { "" },
+            m.AllocationBase as usize, m.AllocationProtect, m.BaseAddress as usize, m.RegionSize, m.State, m.Protect, m.Type
+        );
+    }
+    -1 // EXCEPTION_CONTINUE_EXECUTION
+}
+
 unsafe extern "system" fn null_call_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
     static SEEN: AtomicUsize = AtomicUsize::new(0);
     let rec = &*(*info).ExceptionRecord;
