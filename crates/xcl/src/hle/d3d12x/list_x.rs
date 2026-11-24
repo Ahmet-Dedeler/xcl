@@ -987,6 +987,9 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     }
     let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+        if cpu_copy(this, dst as usize, src as usize, size as usize) {
+            return;
+        }
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
     note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
@@ -1002,6 +1005,37 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
     transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+/// CopyMemoryToMemoryX with neither end in unified memory, the destination the title's own
+/// writable memory and the source memory the CPU can read for the GPU – the title's own, or a
+/// GPU view of it (a retail game reads pages it mapped for the GPU only this way: 16 KiB from
+/// its page pool's GPU view into its heap). Nothing the GPU wrote is involved (a title texture
+/// the GPU wrote over the source: not this), so the CPU copies when the GPU has finished the
+/// work before it (`cpu_writes`). Whether the copy was taken.
+unsafe fn cpu_copy(list: *mut c_void, dst: usize, src: usize, len: usize) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    let in_uma = |a: usize| u.window_of(a).is_some() || u.window_of(a + len - 1).is_some();
+    if in_uma(dst) || in_uma(src) || !super::cpu_writes::writable(dst, len) || super::title_textures::gpu_written_over(src, len) {
+        return false;
+    }
+    let view = crate::hle::kernelx::mirrors::source(src).is_some() || super::gpu_views::in_range(src, len);
+    if !view && !crate::gpu::shader::readable(src, len) {
+        return false;
+    }
+    let recorded = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))).map(|s| s.cpu_writes.push(super::cpu_writes::Write::Copy { dst, src, len })).is_some();
+    if !recorded {
+        return false;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 4 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: CopyMemoryToMemoryX: {src:#x} → {dst:#x} ({len:#x} bytes) is outside unified memory: copied by the CPU once the GPU is there (#{n}; the source is {})",
+            if view { "in a GPU view of the title's memory" } else { "the title's own memory" }
+        );
+    }
+    true
 }
 
 unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
