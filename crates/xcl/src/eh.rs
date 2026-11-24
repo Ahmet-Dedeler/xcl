@@ -329,8 +329,10 @@ const HELPERS_SIZE: usize = 0x1_0000;
 static PATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REDIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Free address space for the helpers: the nearest 64 KiB above `near`, else below.
-unsafe fn alloc_near(near: usize) -> usize {
+/// Free address space for helpers within reach of a `call rel32` from `near`: the nearest
+/// `size` bytes (a multiple of 64 KiB) above it, else below; committed, readable, writable and
+/// executable. 0: none.
+pub(crate) unsafe fn alloc_near(near: usize, size: usize) -> usize {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
     const REACH: usize = 0x7000_0000;
     let query = |at: usize| -> Option<(usize, usize, bool)> {
@@ -338,14 +340,14 @@ unsafe fn alloc_near(near: usize) -> usize {
         (VirtualQuery(at as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0)
             .then(|| (mbi.BaseAddress as usize, (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize), mbi.State == MEM_FREE))
     };
-    let take = |p: usize| VirtualAlloc(p as *const _, HELPERS_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
+    let take = |p: usize| VirtualAlloc(p as *const _, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
     let mut at = near & !0xFFFF;
     for _ in 0..4096 {
         let Some((_, end, free)) = query(at) else { break };
         if at - (near & !0xFFFF) > REACH {
             break;
         }
-        if free && at + HELPERS_SIZE <= end {
+        if free && at + size <= end {
             let p = take(at);
             if p != 0 {
                 return p;
@@ -363,7 +365,7 @@ unsafe fn alloc_near(near: usize) -> usize {
             break;
         }
         let Some((base, _, free)) = query(at - 1) else { break };
-        let p = at - HELPERS_SIZE;
+        let p = at.saturating_sub(size);
         if free && p >= base {
             let p = take(p);
             if p != 0 {
@@ -399,7 +401,7 @@ unsafe fn redirect(site: usize, code: &[u8], t: &isa::Thunk, helper: &[u8; isa::
         }
         let mut pool = HELPERS.load(Ordering::Relaxed);
         if pool == 0 {
-            pool = alloc_near(site).max(1);
+            pool = alloc_near(site, HELPERS_SIZE).max(1);
             HELPERS.store(pool, Ordering::Relaxed);
         }
         let used = HELPERS_USED.load(Ordering::Relaxed);
