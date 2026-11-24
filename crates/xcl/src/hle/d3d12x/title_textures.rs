@@ -1457,6 +1457,20 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     out
 }
 
+/// `len` bytes of the title's memory at `at` as the GPU would see them (`TitleMemory`: a GPU
+/// view's pages where the CPU has them), zeros where there is nothing, and whether all of it
+/// was there.
+pub(super) unsafe fn read_memory(at: usize, len: usize) -> (Vec<u8>, bool) {
+    let mut out = vec![0u8; len];
+    let all = TitleMemory::new().read(at, out.as_mut_ptr(), len);
+    (out, all)
+}
+
+/// Whether a title texture the GPU wrote lies over `[va, va + len)`: the memory there is stale.
+pub(super) fn gpu_written_over(va: usize, len: usize) -> bool {
+    TEXTURES.lock().unwrap().by_res.values().any(|e| e.gpu_written && e.va < va + len && va < e.va + e.tex.size() as usize)
+}
+
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
 const PARALLEL_BYTES: usize = 1 << 20;
 

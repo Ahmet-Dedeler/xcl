@@ -1,5 +1,6 @@
 //! Write32/64BitValueBottomOfPipeX into memory the GPU does not see: done by the CPU once the GPU
-//! has finished the work before them.
+//! has finished the work before them. CopyMemoryToMemoryX between two such places goes the same
+//! way (`Write::Copy`).
 //!
 //! A console title marks its GPU progress with bottom-of-pipe writes into its own memory and
 //! waits on them (a retail game: plain `VirtualAlloc` memory, outside XCL's unified memory).
@@ -28,6 +29,18 @@ pub(super) enum Write {
     /// (`src`), copied atomically to `va` once the queue's fence completes. Holding `_buf` keeps
     /// the mapping alive until the worker finishes.
     ReadbackU64 { va: usize, src: usize, _buf: ID3D12Resource },
+    /// CopyMemoryToMemoryX with neither end in unified memory: `len` bytes from `src`, read as
+    /// the GPU would see them (`title_textures::read_memory`: a GPU view's pages where the CPU
+    /// has them), to `dst` in the title's own memory
+    Copy { dst: usize, src: usize, len: usize },
+}
+
+/// copies done so far, and those whose source had no memory for some of its bytes (zeros)
+static COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// (CopyMemoryToMemoryX copies done by the CPU, those with a source that was not all there)
+pub fn copies() -> (u64, u64) {
+    (COPIES[0].load(Ordering::Relaxed), COPIES[1].load(Ordering::Relaxed))
 }
 
 struct Job {
@@ -77,6 +90,7 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                             let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
                             write_u64_now(*va, value);
                         }
+                        Write::Copy { dst, src, len } => copy_now(*dst, *src, *len),
                     }
                 }
             }
@@ -115,6 +129,19 @@ unsafe fn write_u64_now(va: usize, value: u64) {
         return;
     }
     (*(va as *const AtomicU64)).store(value, Ordering::Release);
+}
+
+/// `len` bytes from `src` as the GPU would see them to `dst`, if `dst` is still writable.
+unsafe fn copy_now(dst: usize, src: usize, len: usize) {
+    if !writable(dst, len) {
+        return;
+    }
+    let (data, all) = super::title_textures::read_memory(src, len);
+    std::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, len);
+    let n = COPIES[0].fetch_add(1, Ordering::Relaxed);
+    if !all && COPIES[1].fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: CopyMemoryToMemoryX {src:#x} → {dst:#x} ({len:#x} bytes), copy #{n} by the CPU: part of the source has no memory (zeros there)");
+    }
 }
 
 /// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
@@ -182,13 +209,18 @@ mod tests {
             let cell = Box::new([0u32; 2]);
             let va = cell.as_ptr() as usize;
             assert!(writable(va, 8));
-            after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]);
+            // (and a copy between two places the GPU does not see, after the words)
+            let from = Box::new([0x1111_2222u32, 0x3333_4444, 0x5555_6666]);
+            let to = Box::new([0u32; 3]);
+            let (src, dst) = (from.as_ptr() as usize, to.as_ptr() as usize);
+            after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9]), Write::Copy { dst, src, len: 12 }]);
             let t = std::time::Instant::now();
-            while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
+            while (*((dst + 8) as *const AtomicU32)).load(Ordering::Acquire) != 0x5555_6666 {
                 assert!(t.elapsed().as_secs() < 5, "never written");
                 std::thread::yield_now();
             }
             assert_eq!(*cell, [7, 9]);
+            assert_eq!(*to, *from);
         }
     }
 
