@@ -1994,10 +1994,12 @@ upstream's own versions were taken wherever it has one, and each local change is
   known translations, and the opt-in diagnostics (`XCL_BACKGROUND`, `XCL_REMOTE_INPUT`, `XCL_DUMP_THREADS_AT`,
   `XCL_CRASH_AT`, the DirectStorage and depth-view traces).
 
-## The Mac port on upstream a6f5f7a (branch `mac5`, 2026-11-24; 7 live runs, bottle `xcl-gta6`)
-`mac4` rebased twice (onto db1ddb2, then a6f5f7a), with what the old base's video / image lanes had that this base
-still needs. Runs: fresh profile through the first-run pages (r3 pairing only, r4 / r6 the full build), the profile
-with accepted terms into loading (r5, r7). Network off in every run (0 "HTTP Return code" lines), no sound
+## The Mac port on upstream 7ebf1b8 (branch `mac5`, 2026-11-24; 10 live runs, bottle `xcl-gta6`)
+`mac4` rebased three times (onto db1ddb2, a6f5f7a, 7ebf1b8), with what the old base's video / image lanes had that
+this base still needs. Runs: fresh profile through the first-run pages (r3 pairing only; r4, r6 the full build on
+db1ddb2 / a6f5f7a; r8 – r10 on 7ebf1b8), the profile with accepted terms into loading (r5, r7; on db1ddb2 / a6f5f7a).
+Then rebased once more onto 508a0c7 (the frame rate in the window title; no conflict): built, 91 unit tests, and
+r11 to the sign-in bar, the video and the first two pages – the sign-in capture is r10's pixel for pixel. Network off in every run (0 "HTTP Return code" lines), no sound
 (`xapu: 0 Opus packets decoded`: no `opus.dll` next to xcl.exe, `XCL_OPUS_DIR` unset – upstream's 2b4bb43 loads
 libopus at run time, the cross-build needs nothing new).
 - **Upstream's mechanisms on this host.**
@@ -2028,6 +2030,13 @@ libopus at run time, the cross-build needs nothing new).
     r7. *Lazy pages (77905f6)*: not reached here (`XCL_LAZY_PAGES` off: `lazy::mark` commits at once).
     *CPU check (5ba2b6a)*: passes under Rosetta as before. *readable (ef5312f)*: Wine on macOS reports no working
     set, the region walk answers, with the native host's IsBadReadPtr branch as before.
+  - *Unchanged uploads left out (69f0635)*: off on a Mac (`title_textures::unchanged_skip`,
+    `XCL_TEXTURE_SKIP_UNCHANGED=1` forces it). With it the whole picture is one flat grey (r8: all 18 window
+    captures RGB 50 / 50 / 50 while the title presents and draws as usual); the same build with `=0` (r9) and with
+    the new default (r10) shows the sign-in bar, the video and the menus. Which upload must go up again with the
+    same bytes is not found. Nothing is hashed twice there: on this host the title's textures are in memory that
+    is not write-watched and go up when the content comparison finds a change; where memory is write-watched the
+    comparison does not run and upstream's check is the only one.
   - *Network (db1ddb2)*: upstream's hooks in the system's winhttp / wininet / ws2_32 install here ("the system's
     WinHTTP, WinINet and Winsock refuse …" in every log). Kept from ours: off unless `XCL_NETWORK=1`, the proxy
     lookups, bind to loopback, the other networking DLLs as stubs, wsock32, lookups by ordinal, and the test of
@@ -2039,11 +2048,12 @@ libopus at run time, the cross-build needs nothing new).
   went back to and that was decommitted in the same call was taken for committed by `sparse::page_committed`
   once the windows are on the GPU: a read of decommitted memory, found by upstream's new GPU test running before
   the kernelx tests). `XCL_DUMP_THREADS_ON=<file>`, `XCL_PROBE_MOV=<image offset>`.
-- **Menus (r6, commit "Tests: what a Mac host answers differently …").** Sign-in bar, intro video with pictures,
+- **Menus (r10, the branch's last code commit, fresh profile).** Sign-in bar, intro video with pictures,
   NAVIGATION EXPERIENCE / UI TEXT SIZE / SUBTITLES with complete text and both arrows, BRIGHTNESS, FINISH SETUP?
-  and LEGAL NOTICES with artwork; 60 presents per 2 s on every page; 0 "Failed to compile fragment function".
-  Not shown: the tick on the terms page (the driver did not get past LEGAL NOTICES: Next is greyed for a few
-  seconds). Under the video's first seconds the front end loads: 807 – 948 textures change and 3.3 – 3.8 GiB go
+  and LEGAL NOTICES with artwork, the terms page with its first box unticked, ticked (the tick shows) and
+  unticked again – Confirm was never reached; 60 presents per 2 s on every page (30 and 32 in the two samples
+  where the front end loads under the video); 0 "Failed to compile fragment function". r6 showed the same on
+  a6f5f7a without the terms page. Under the video's first seconds the front end loads: 807 – 948 textures change and 3.3 – 3.8 GiB go
   up in 300 frames, 2.4 – 3.5 s of comparing with the machine otherwise quiet (r4, r7), 13 s with a load average
   of 22 (r6: 5 – 23 fps there).
 - **Loading with accepted terms (r5, r7): what stops it.** The title goes from the sign-in A and the video A
@@ -2065,8 +2075,10 @@ libopus at run time, the cross-build needs nothing new).
   CreatePlacedResourceX (`register` → `physical_page_at`). 16,384+ textures are registered in the GPU view by
   then; 7,377 changed in the last 300 frames. Memory was no limit yet: 74 – 78 % of 64 GB free throughout, video
   memory 2.2 – 3.2 GB, the DXC gate held nothing back, no D3DMetal assertion; the wall of placed textures
-  (#248) was not reached.
+  (#248) was not reached, nor the world: list #101 and the title's "GPU Loc Sig" watchdog (issue #505) were not
+  seen, and the refused BCPack requests (179 of 37,450) are not what stops it here. Both loading runs were on
+  a6f5f7a or older; loading was not run again on 7ebf1b8.
 - **Unit tests** under Wine in the bottle (module paths `hle::netoff`, `hle::d3d12x::{title_textures, gpu_views,
   cpu_writes, vram, sparse}`, `hle::kernelx`, `gpu::shader::tests`, `isa`, `insn`, `gpu::tiling`, `gpu::uma`,
-  the stand-in test): 90 passed, one and four at a time. `hle::d3d12x::list_x`'s GPU tests hang on this host
+  the stand-in test): 91 passed on 7ebf1b8 (90 on a6f5f7a, one and four at a time). `hle::d3d12x::list_x`'s GPU tests hang on this host
   (not looked at); three of upstream's tests state what this host does not have and skip or relax that part.
