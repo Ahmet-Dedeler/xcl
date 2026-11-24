@@ -92,6 +92,15 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("XCL_LATE_RELEASE").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// Resources held now: (not let go yet, of them in batches closed with a fence value). None:
+/// the lock is held (a drain is under way).
+pub fn held() -> Option<(usize, usize)> {
+    let late = LATE.lock().unwrap().len();
+    let g = HELD.try_lock().ok()?;
+    let (open, sealed) = g.as_ref().map_or((0, 0), |h| (h.open.len(), h.sealed.iter().map(|b| b.dead.len()).sum()));
+    Some((late + open + sealed, sealed))
+}
+
 /// how long a last `Release` itself waits for queues with nothing to do to say so
 const IDLE_WAIT: Duration = Duration::from_micros(300);
 

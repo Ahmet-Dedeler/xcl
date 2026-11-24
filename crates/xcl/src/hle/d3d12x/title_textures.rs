@@ -336,6 +336,11 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// title textures kept in step with the title's memory now
+pub fn count() -> usize {
+    TEXTURES_LEN.load(Ordering::Relaxed)
+}
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
