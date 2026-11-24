@@ -2685,6 +2685,12 @@ mod tests {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         const PAGE: usize = 0x10000;
         const PAGES: usize = 16;
+        // (the copy that tolerates it is ReadProcessMemory, which Wine's server on macOS answers
+        // by suspending the process: `TitleMemory::read` copies directly there)
+        if crate::util::mac_host() {
+            println!("SKIPPED read_committed_tolerates_concurrent_decommit: title memory is copied directly on this host");
+            return;
+        }
         unsafe {
             let base = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
             assert_ne!(base, 0);
