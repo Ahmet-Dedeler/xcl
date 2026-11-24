@@ -1498,6 +1498,7 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
+    s.forget_gone();
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
     s.signal();
     Some((hr, delta))
@@ -1505,15 +1506,42 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
 pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+    // A release can come from inside a call the holder of the state's lock is making (a host
+    // that releases its own references through the object's table – Apple's D3DMetal – does it
+    // when a list of XCL's own is reset or executed): never wait for the lock here. What could
+    // not be forgotten at once is forgotten by the next holder (`State::forget_gone`).
+    match STATE.try_lock() {
+        Ok(mut g) => {
+            if let Some(s) = g.as_mut() {
+                s.forget_gone();
+                s.forget(res);
+            }
+        }
+        Err(std::sync::TryLockError::WouldBlock) => GONE.lock().unwrap().push(res),
+        Err(std::sync::TryLockError::Poisoned(_)) => {}
+    }
+}
+
+/// buffers released while the state was locked
+static GONE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+impl State {
+    fn forget_gone(&mut self) {
+        let gone = std::mem::take(&mut *GONE.lock().unwrap());
+        for res in gone {
+            self.forget(res);
+        }
+    }
+
+    fn forget(&mut self, res: usize) {
+        let Some(tiles) = self.buffers.remove(&res) else { return };
+        for tile in tiles {
+            if let Some(c) = self.pinned.get_mut(&tile) {
+                *c -= 1;
+                if *c == 0 {
+                    self.pinned.remove(&tile);
+                    self.release_if_unused(tile);
+                }
             }
         }
     }
