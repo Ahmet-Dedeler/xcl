@@ -10,6 +10,7 @@
 //! signalled on every queue with work on it; the batch goes once all of them have passed it.
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -91,10 +92,10 @@ pub fn enabled() -> bool {
     // (no lock, not even a OnceLock's: this is asked in every Release, and a Release can come on
     // any thread at any depth – two that ask first at once both read the variable)
     static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    match ON.load(std::sync::atomic::Ordering::Relaxed) {
+    match ON.load(Ordering::Relaxed) {
         0 => {
             let on = !std::env::var("XCL_LATE_RELEASE").is_ok_and(|v| v.trim() == "0");
-            ON.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+            ON.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
         n => n == 1,
@@ -104,7 +105,7 @@ pub fn enabled() -> bool {
 /// Resources held now: (not let go yet, of them in batches closed with a fence value). None:
 /// the lock is held (a drain is under way).
 pub fn held() -> Option<(usize, usize)> {
-    let late = LATE.lock().unwrap().len();
+    let late = LATE.lock().unwrap().len() + RING_HEAD.load(Ordering::Relaxed).wrapping_sub(RING_TAIL.load(Ordering::Relaxed));
     let g = HELD.try_lock().ok()?;
     let (open, sealed) = g.as_ref().map_or((0, 0), |h| (h.open.len(), h.sealed.iter().map(|b| b.dead.len()).sum()));
     Some((late + open + sealed, sealed))
@@ -125,7 +126,7 @@ pub unsafe fn hold(res: usize) {
     // On such a host (its D3D12 in no PE module) nothing else is done on this thread either: the
     // queues are not asked from inside a call the host is in the middle of, and no heap over
     // the title's memory waits for the resource there (no OpenExistingHeapFromAddress).
-    if crate::gpu::shader::NATIVE_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed) {
+    if crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed) {
         LATE.lock().unwrap().push(res);
         start_thread();
         return;
@@ -157,6 +158,48 @@ pub unsafe fn hold(res: usize) {
 /// resources `hold` could not note because the lock was held (never held across a host call)
 static LATE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// Resources handed over by a Release that may neither lock nor wait (`hand_over`): a ring of
+/// slots written with atomics alone – one writer per claimed index, read by whoever drains.
+const RING: usize = 1 << 14;
+static RING_SLOTS: [AtomicUsize; RING] = [const { AtomicUsize::new(0) }; RING];
+/// the next index to write, and the next to read
+static RING_HEAD: AtomicUsize = AtomicUsize::new(0);
+static RING_TAIL: AtomicUsize = AtomicUsize::new(0);
+/// one drain of the ring at a time
+static RING_DRAIN: Mutex<()> = Mutex::new(());
+
+/// `res` (an adopted resource the title released for good, one reference kept) is left to the
+/// thread here: what XCL keeps by its address is forgotten there (`real::forget_released`) and
+/// the object let go once the queues are past the work in flight. Nothing but atomics on the
+/// calling thread. False: no room (the caller does it the other way).
+pub fn hand_over(res: usize) -> bool {
+    // (room left for the writers that claim an index at the same moment)
+    if RING_HEAD.load(Ordering::Acquire).wrapping_sub(RING_TAIL.load(Ordering::Acquire)) >= RING - 256 {
+        return false;
+    }
+    let i = RING_HEAD.fetch_add(1, Ordering::AcqRel);
+    RING_SLOTS[i % RING].store(res, Ordering::Release);
+    true
+}
+
+/// The resources handed over so far, in order (an index claimed but not written yet ends the
+/// look: it is there the next time).
+fn take_handed_over() -> Vec<usize> {
+    let _one = RING_DRAIN.lock().unwrap();
+    let mut out = Vec::new();
+    let mut i = RING_TAIL.load(Ordering::Acquire);
+    while i != RING_HEAD.load(Ordering::Acquire) {
+        let res = RING_SLOTS[i % RING].swap(0, Ordering::AcqRel);
+        if res == 0 {
+            break;
+        }
+        out.push(res);
+        i = i.wrapping_add(1);
+        RING_TAIL.store(i, Ordering::Release);
+    }
+    out
+}
+
 pub(super) fn start_thread() {
     static THREAD: std::sync::Once = std::sync::Once::new();
     THREAD.call_once(|| {
@@ -173,9 +216,15 @@ pub(super) fn start_thread() {
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
+    // what was handed over from threads that must not wait: forgotten here, then held
+    let handed = take_handed_over();
+    for &res in &handed {
+        super::real::forget_released(res);
+    }
     {
         let mut g = HELD.lock().unwrap();
-        let late = std::mem::take(&mut *LATE.lock().unwrap());
+        let mut late = std::mem::take(&mut *LATE.lock().unwrap());
+        late.extend(handed);
         if !late.is_empty() {
             g.get_or_insert_with(Held::default).open.extend(late);
         }

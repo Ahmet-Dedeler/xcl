@@ -1709,35 +1709,48 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     if n == 0 {
-        if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
+        // On a host that calls Release on threads of its own (a native host: D3DMetal does at
+        // submit, for a barrier's resource, and inside calls XCL makes) nothing but a queue
+        // entry is made here when the object is kept: no lock of XCL's is waited for and no
+        // fence – what XCL keeps by the address is forgotten by `late_release`'s thread, which
+        // then lets the object go (the address cannot come again before that).
+        if held && crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed) && super::late_release::hand_over(this as usize) {
+            return 0;
         }
-        if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
-        }
-        if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
-            m.remove(&(this as usize));
-        }
-        if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
-            m.remove(&(this as usize));
-        }
-        super::sparse::forget_buffer(this as usize);
-        super::present::forget(this as usize);
-        super::vram::forget(this as usize);
-        super::title_textures::forget(this as usize);
-        let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
-        if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free_at_release(p);
-            } else {
-                u.free(p);
-            }
-        }
+        forget_released(this as usize);
     }
     if held {
         super::late_release::hold(this as usize);
     }
     n
+}
+
+/// A resource the title has released for good: what XCL keeps by its address goes.
+pub(super) unsafe fn forget_released(this: usize) {
+    if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+        s.remove(&(this));
+    }
+    if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
+        s.remove(&(this));
+    }
+    if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
+        m.remove(&(this));
+    }
+    if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+        m.remove(&(this));
+    }
+    super::sparse::forget_buffer(this);
+    super::present::forget(this);
+    super::vram::forget(this);
+    super::title_textures::forget(this);
+    let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this)));
+    if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
+        if u.is_sparse(p) {
+            super::sparse::free_at_release(p);
+        } else {
+            u.free(p);
+        }
+    }
 }
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
