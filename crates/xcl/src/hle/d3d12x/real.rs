@@ -46,7 +46,7 @@ const MAX_SCAN: usize = 512;
 /// D3DMetal does both), reads them through the object's table pointer.
 const PREFIX: usize = 16;
 /// Words in front of an extended vtable: the original table's address, then the mirror.
-const HDR: usize = PREFIX + 1;
+pub(super) const HDR: usize = PREFIX + 1;
 /// words of a native host's method table kept after the public methods (see `class_for`)
 const NATIVE_HOST_TAIL: usize = 512;
 
@@ -6069,10 +6069,11 @@ mod readback_routing_tests {
         let mut orig_vt = [0usize; 32];
         orig_vt[23] = fake_copy_ranges as usize;
         orig_vt[24] = fake_copy_simple as usize;
-        let ext_vt = [orig_vt.as_ptr() as usize, 0usize];
+        let mut ext_vt = [0usize; HDR + 1];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
         let mut dev = FakeDev {
-            // SAFETY: `ext_vt` has 2 entries; `.add(1)` puts `orig_vt` at `ext[-1]`.
-            vt: unsafe { ext_vt.as_ptr().add(1) },
+            // SAFETY: `.add(HDR)` is slot 0, with the original table at `ext[-HDR]` for `real::orig_fn`.
+            vt: unsafe { ext_vt.as_ptr().add(HDR) },
         };
         let dev_ptr = &mut dev as *mut FakeDev as *mut c_void;
 

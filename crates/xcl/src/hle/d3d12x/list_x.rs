@@ -4221,8 +4221,9 @@ mod tests {
     fn reset_commits_state_only_after_native_success_and_always_restores_vtable() {
         let mut native = vec![0usize; PC_RESET + 1];
         native[PC_RESET] = reset_test_native as usize;
-        let extended = [native.as_ptr() as usize, 0usize];
-        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let mut extended = [0usize; real::HDR + 1];
+        extended[0] = native.as_ptr() as usize;
+        let ext = unsafe { extended.as_ptr().add(real::HDR) as usize };
         let replacement = 0x1234_5678usize;
         let mut object = [ext];
         let list = object.as_mut_ptr() as *mut c_void;
@@ -4734,11 +4735,12 @@ mod tests {
         let mut orig_list_vt = [0usize; 70];
         orig_list_vt[PC_RESOLVE_QUERY_DATA] = fake_resolve as usize;
         orig_list_vt[PC_WRITE_BUFFER_IMMEDIATE] = fake_write_immediate as usize;
-        // Adopted objects store `orig` at `ext[-1]`.
-        let ext_list_vt = [orig_list_vt.as_ptr() as usize, 0usize];
+        // Adopted objects store `orig` at `ext[-HDR]`.
+        let mut ext_list_vt = [0usize; real::HDR + 1];
+        ext_list_vt[0] = orig_list_vt.as_ptr() as usize;
         let mut fake_list = FakeCom {
-            // SAFETY: `ext_list_vt` has 2 elements; `.add(1)` points at `ext[0]` with `ext[-1] = orig`.
-            vt: unsafe { ext_list_vt.as_ptr().add(1) },
+            // SAFETY: `.add(HDR)` is slot 0, with the original table at `ext[-HDR]` for `real::orig_fn`.
+            vt: unsafe { ext_list_vt.as_ptr().add(real::HDR) },
         };
 
         let mut res_vt = [0usize; 16];
@@ -4823,13 +4825,13 @@ mod tests {
         orig_vt[42] = fake_noop_uav as usize; // SetGraphicsRootUnorderedAccessView
         orig_vt[43] = fake_set_ib as usize;
 
-        let mut ext_vt = vec![0usize; 65];
+        let mut ext_vt = vec![0usize; real::HDR + 64];
         ext_vt[0] = orig_vt.as_ptr() as usize;
-        ext_vt[1..].copy_from_slice(&orig_vt);
+        ext_vt[real::HDR..].copy_from_slice(&orig_vt);
 
         let fake = Box::new(FakeDrawList {
-            // SAFETY: `ext_vt` has 65 entries so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
-            vt: unsafe { ext_vt.as_ptr().add(1) },
+            // SAFETY: `.add(HDR)` is slot 0, with the original table at `ext[-HDR]` for `real::orig_fn`.
+            vt: unsafe { ext_vt.as_ptr().add(real::HDR) },
             refs: AtomicUsize::new(1),
             draws: Mutex::new(Vec::new()),
             index_buffers: Mutex::new(Vec::new()),
@@ -4954,12 +4956,12 @@ mod tests {
 
         let mut orig_vt = [0usize; 64];
         orig_vt[PC_OM_SET_RENDER_TARGETS] = fake_om_set_render_targets as usize;
-        let mut ext_vt = [0usize; 2];
+        let mut ext_vt = [0usize; real::HDR + 1];
         ext_vt[0] = orig_vt.as_ptr() as usize;
 
         let fake = Box::new(FakeRtList {
-            // SAFETY: `ext_vt` has 2 entries so `.add(1)` has `orig_vt` at `-1` as `real::orig_fn` expects.
-            vt: unsafe { ext_vt.as_ptr().add(1) },
+            // SAFETY: `.add(HDR)` is slot 0, with the original table at `ext[-HDR]` for `real::orig_fn`.
+            vt: unsafe { ext_vt.as_ptr().add(real::HDR) },
             calls: Mutex::new(Vec::new()),
         });
         let list_ptr = &*fake as *const FakeRtList as *mut c_void;
@@ -5100,13 +5102,13 @@ mod tests {
         orig_vt[PC_RESOURCE_BARRIER] = fake_resource_barrier as usize;
         orig_vt[PC_SET_PREDICATION] = fake_set_predication as usize;
 
-        let mut ext_vt = [0usize; 65];
+        let mut ext_vt = [0usize; real::HDR + 64];
         ext_vt[0] = orig_vt.as_ptr() as usize;
-        ext_vt[1..].copy_from_slice(&orig_vt);
+        ext_vt[real::HDR..].copy_from_slice(&orig_vt);
 
         let fake = Box::new(FakePredList {
-            // SAFETY: `ext_vt` has 65 entries so `.add(1)` points at slot 0 with `orig_vt` at `-1`.
-            vt: unsafe { ext_vt.as_ptr().add(1) },
+            // SAFETY: `.add(HDR)` is slot 0, with the original table at `ext[-HDR]` for `real::orig_fn`.
+            vt: unsafe { ext_vt.as_ptr().add(real::HDR) },
             ty: Mutex::new(D3D12_COMMAND_LIST_TYPE_DIRECT),
             events: Mutex::new(Vec::new()),
         });
@@ -5291,12 +5293,12 @@ mod tests {
 
             let list_ptr = list.as_raw();
             let orig_vt = *(list_ptr as *const *const usize);
-            let mut ext_vt = [0usize; 65];
+            let mut ext_vt = [0usize; real::HDR + 64];
             ext_vt[0] = orig_vt as usize;
-            std::ptr::copy_nonoverlapping(orig_vt, ext_vt.as_mut_ptr().add(1), 64);
+            std::ptr::copy_nonoverlapping(orig_vt, ext_vt.as_mut_ptr().add(real::HDR), 64);
 
             on_create(list_ptr, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
-            *(list_ptr as *mut *const usize) = ext_vt.as_ptr().add(1);
+            *(list_ptr as *mut *const usize) = ext_vt.as_ptr().add(real::HDR);
 
             let bottom_ts = Box::new(0u64);
             let top_ts = Box::new(0u64);
