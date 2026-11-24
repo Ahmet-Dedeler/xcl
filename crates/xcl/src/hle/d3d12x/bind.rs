@@ -1044,15 +1044,15 @@ mod tests {
         orig_vt[41] = fake_set_compute_uav as usize;
         orig_vt[59] = fake_execute_indirect as usize;
 
-        // Extended vtable layout expected by `real::orig_fn`: entry -1 holds `orig_vt` pointer,
-        // and entries 0..64 hold the COM method pointers used via `ID3D12GraphicsCommandList`.
-        let mut ext_vt = vec![0usize; 65];
+        // Extended vtable layout expected by `real::orig_fn`: entry -HDR holds the `orig_vt`
+        // pointer, and entries 0..64 hold the COM method pointers used via `ID3D12GraphicsCommandList`.
+        let mut ext_vt = vec![0usize; real::HDR + 64];
         ext_vt[0] = orig_vt.as_ptr() as usize;
-        ext_vt[1..].copy_from_slice(&orig_vt);
+        ext_vt[real::HDR..].copy_from_slice(&orig_vt);
 
         let fake = Box::new(FakeAdoptedList {
-            // SAFETY: `ext_vt` has 65 elements so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
-            vt: unsafe { ext_vt.as_ptr().add(1) },
+            // SAFETY: `.add(HDR)` is slot 0, with the original table at `ext[-HDR]` for `real::orig_fn`.
+            vt: unsafe { ext_vt.as_ptr().add(real::HDR) },
             refs: AtomicUsize::new(1),
             dispatch_calls: AtomicUsize::new(0),
             set_compute_rs_calls: AtomicUsize::new(0),
