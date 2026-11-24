@@ -797,15 +797,21 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
+/// `XCL_FRAME_DUMP_FROM=<frame>`: none before that frame (a retail game's presents have stopped
+/// at a dump in its first 500 frames on a Mac; where no window can be captured, the dumps of
+/// the frames after are the only picture).
 fn frame_dump_due() -> bool {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
-        Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
-        Err(_) => 0,
+    static EVERY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (every, from) = *EVERY.get_or_init(|| {
+        let every = match std::env::var("XCL_FRAME_DUMP") {
+            Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
+            Err(_) => 0,
+        };
+        (every, std::env::var("XCL_FRAME_DUMP_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
     });
     // the first frames too: a title under bring-up may never reach its 20th
     let n = PRESENTS.load(Ordering::Relaxed);
-    every > 0 && (n < 4 || n % every == 20.min(every - 1))
+    every > 0 && n >= from && (n < 4 || n % every == 20.min(every - 1))
 }
 
 /// Frames shown so far.
