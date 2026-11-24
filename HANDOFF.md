@@ -1993,3 +1993,80 @@ upstream's own versions were taken wherever it has one, and each local change is
   `page_committed` / `live_zero_runs`, the gap-audit fixes, the per-compiler DXC heap (Wine only by default) and
   known translations, and the opt-in diagnostics (`XCL_BACKGROUND`, `XCL_REMOTE_INPUT`, `XCL_DUMP_THREADS_AT`,
   `XCL_CRASH_AT`, the DirectStorage and depth-view traces).
+
+## The Mac port on upstream a6f5f7a (branch `mac5`, 2026-11-24; 7 live runs, bottle `xcl-gta6`)
+`mac4` rebased twice (onto db1ddb2, then a6f5f7a), with what the old base's video / image lanes had that this base
+still needs. Runs: fresh profile through the first-run pages (r3 pairing only, r4 / r6 the full build), the profile
+with accepted terms into loading (r5, r7). Network off in every run (0 "HTTP Return code" lines), no sound
+(`xapu: 0 Opus packets decoded`: no `opus.dll` next to xcl.exe, `XCL_OPUS_DIR` unset – upstream's 2b4bb43 loads
+libopus at run time, the cross-build needs nothing new).
+- **Upstream's mechanisms on this host.**
+  - *Write-watched fallback (e93dc9c)* cannot be on: `XCL_WATCHED_FALLBACK=1` ended the run 5 s in ("rosetta error:
+    unexpectedly need to EmulateForward", `vpmaskmovd [rax], ymm6, ymm4` at image +0x5553054). Off on a Mac
+    (`kernelx::watched_fallback`); the reservations are still paired. The content comparison
+    (`title_textures::poll_unwatched`) is what uploads CPU writes there – upstream's own real-GPU test
+    (`gpu_mirror_upload_follows_cpu_writes_and_later_mapping_changes`) passes on this host through it.
+  - *Pairing of the two 24 GiB reservations (9bd7635)* works as it is: "reservation 0x7000000000 … is the GPU view
+    of 0x720000000". With it alone (r3, exe of commit "kernelx: on a Mac …") the intro video shows pictures, the
+    option pages both arrows, BRIGHTNESS its symbol, FINISH SETUP? and LEGAL NOTICES their artwork – pixel for pixel
+    what the full build shows (r4). The video's planes go up by the content comparison at 30 fps once the front
+    end is loaded (20 – 25 fps for ~4 s while it loads underneath), so the old base's Bink wrapper (`bec08f9`) was
+    not brought over (kept as `../bink-port.patch`, not built in).
+  - *Command queue #31* (`d3d12x/gpu_views`, from the old base's `da2e2fc`) is kept as the first source of a GPU
+    view's page, the pairing as the fallback (`title_textures::TitleMemory`). In the menus (r4, r6): 2,466 – 2,472
+    pages read where #31 and the pairing agree, 696 – 698 only #31 reaches (pages the title mapped for the GPU only),
+    2 by the pairing alone; into loading (r7) 2,248 / 883 / 316, and 4,046 pages of 16,000+ young textures with no
+    memory yet. The 698 pages are not on the first-run pages (r3 = r4), so on this base #31 changes nothing visible
+    there; it is what a streamed texture filled through a physical page array is read by.
+    `XCL_GPU_PAGE_MAPPINGS=0` turns it off, `XCL_TRACE_PAGE_VIEWS=1` counts the calls; the frame-rate line is
+    followed by the pages by source and by what the comparison cost.
+  - *Shared texture pages (#288)*: off on a native host with the reserved targets (`vram::on_pages`,
+    `XCL_VRAM_ARENAS=0` forces them): two reserved textures on the same tiles do not show each other's contents
+    on D3DMetal. The committed path is used; #288's shadowing of overlapped placements (`Table`) applies to it.
+  - *DirectStorage (d0b6079, c8e3ca0)*: no 0x89240009 any more (0 in r5 / r7; 44 of 896 in one window on `mac4`).
+    What still fails is 0x89240030 – BCPack, not decoded: 126 requests while the front end loads, 179 of 37,450 in
+    r7. *Lazy pages (77905f6)*: not reached here (`XCL_LAZY_PAGES` off: `lazy::mark` commits at once).
+    *CPU check (5ba2b6a)*: passes under Rosetta as before. *readable (ef5312f)*: Wine on macOS reports no working
+    set, the region walk answers, with the native host's IsBadReadPtr branch as before.
+  - *Network (db1ddb2)*: upstream's hooks in the system's winhttp / wininet / ws2_32 install here ("the system's
+    WinHTTP, WinINet and Winsock refuse …" in every log). Kept from ours: off unless `XCL_NETWORK=1`, the proxy
+    lookups, bind to loopback, the other networking DLLs as stubs, wsock32, lookups by ordinal, and the test of
+    the default (run with no variable set: passes).
+- **New here.** `d4475b0` (stand-in pixel shaders write both dual-source colours: 12 "Failed to compile fragment
+  function" lines a run without it, 0 with). CopyMemoryToMemoryX with neither end in unified memory is done by
+  the CPU after the GPU (`cpu_writes::Write::Copy`; once a run: 16 KiB from the GPU view at 0x745bb70000 into the
+  title's heap, dropped before). `kernelx::unmap_away` tells the sparse window of every decommit (a home a page
+  went back to and that was decommitted in the same call was taken for committed by `sparse::page_committed`
+  once the windows are on the GPU: a read of decommitted memory, found by upstream's new GPU test running before
+  the kernelx tests). `XCL_DUMP_THREADS_ON=<file>`, `XCL_PROBE_MOV=<image offset>`.
+- **Menus (r6, commit "Tests: what a Mac host answers differently …").** Sign-in bar, intro video with pictures,
+  NAVIGATION EXPERIENCE / UI TEXT SIZE / SUBTITLES with complete text and both arrows, BRIGHTNESS, FINISH SETUP?
+  and LEGAL NOTICES with artwork; 60 presents per 2 s on every page; 0 "Failed to compile fragment function".
+  Not shown: the tick on the terms page (the driver did not get past LEGAL NOTICES: Next is greyed for a few
+  seconds). Under the video's first seconds the front end loads: 807 – 948 textures change and 3.3 – 3.8 GiB go
+  up in 300 frames, 2.4 – 3.5 s of comparing with the machine otherwise quiet (r4, r7), 13 s with a load average
+  of 22 (r6: 5 – 23 fps there).
+- **Loading with accepted terms (r5, r7): what stops it.** The title goes from the sign-in A and the video A
+  into loading; 42 – 55 s later the process ends: "rosetta error: unexpectedly need to EmulateForward on a
+  synchronous exception", `vpmaskmovd [rax + 4*rdx], ymm6, ymm0` at image +0x79d67 – a compiler-vectorised fill
+  of a u32 array (`[rsi + 0x310]`, value `[rsi + 0x338]`) whose every iteration is a masked store. With
+  `XCL_PROBE_MOV=79cfa` (the load of the array pointer): 18 executions, all into unified-memory window 0 (sparse,
+  write-watched, e.g. 0x451da20b0, 107 dwords), the 18th followed by the error. So: title memory in a sparse
+  window is written with masked stores, and one that meets a page the write watch has just protected again
+  (XCL resets the watch at every submit) cannot be resumed by Rosetta. The image has 1,130 masked stores (949
+  vpmaskmovd / q, 181 vmaskmovps / pd, by linear disassembly; the three sites that ended runs so far are among
+  them). Not fixed. What would: no title-writable memory under a write watch on this host (the sparse windows'
+  CPU writes found another way), or the masked stores replaced at load by code the translator can resume
+  (`isa`'s thunks; all sites are 5 bytes or more).
+  Until then, in loading: presents fall from 60 to 2 – 28 per 2 s whenever DirectStorage streams (100 – 270 MB
+  per 2 s; 37,450 requests, 2.5 GB in r7). Two thread dumps (r5, r7) show the same three threads on
+  `kernelx`'s page map lock: a title thread in XMemMapPhysicalPagesScatter (copying pages under it), the render
+  thread in `title_textures::refresh` (`page_address`, once per 64 KiB page compared) and a title thread in
+  CreatePlacedResourceX (`register` → `physical_page_at`). 16,384+ textures are registered in the GPU view by
+  then; 7,377 changed in the last 300 frames. Memory was no limit yet: 74 – 78 % of 64 GB free throughout, video
+  memory 2.2 – 3.2 GB, the DXC gate held nothing back, no D3DMetal assertion; the wall of placed textures
+  (#248) was not reached.
+- **Unit tests** under Wine in the bottle (module paths `hle::netoff`, `hle::d3d12x::{title_textures, gpu_views,
+  cpu_writes, vram, sparse}`, `hle::kernelx`, `gpu::shader::tests`, `isa`, `insn`, `gpu::tiling`, `gpu::uma`,
+  the stand-in test): 90 passed, one and four at a time. `hle::d3d12x::list_x`'s GPU tests hang on this host
+  (not looked at); three of upstream's tests state what this host does not have and skip or relax that part.
