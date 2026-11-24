@@ -2141,3 +2141,61 @@ libopus at run time, the cross-build needs nothing new).
   26 – 30 fps per 300 frames; the pages' arrows were not looked at one by one. The loading screen itself was
   not captured. Run logs and evidence are kept with the run (`run/*.log`, `shots/m2`,
   `exp/` – the Rosetta fault programs, the offline planner check against Capstone and objdump).
+
+## The Mac port on upstream 930e8b4 (branch `mac7`, 2026-11-24; bottle `xcl-gta6`)
+`mac6` (30 commits on 508a0c7) rebased onto 47efa2e (101 upstream commits later) and again onto 930e8b4, with the
+Release fixes below, upstream PR #541 (7 commits, ryosen0) and six small community PRs. Run folder and scripts:
+`../go.sh` (build, lock, run, cleanup), `../menus.sh`, `../load.sh`, `../ut1.sh` (unit tests in the bottle, ends
+only its own process), `../tools/sym.py` (names the xcl.exe frames of a thread dump).
+- **Rebase: kept / replaced by upstream / dropped.**
+  - *Replaced by upstream's:* the row-wise `detile_level` and its test (upstream's 7d60a48 / 1f282c7 are the same
+    thing); `XCL_TRANSLATED_IDENT` (242a6ea keeps translations across builds by the translator's sources and the
+    DXC DLLs: the first run of a new translator translates once more, the DXIL cache still hits); the refusal of
+    BCPack (8cad517 decodes BC1 – BC7: "BCPack BC1 / BC5 / BC7 / BC6H: first request unpacked", no 0x89240030).
+  - *Kept, merged with upstream's new code:* `sparse::new_state` / `shadow_window` (with `parked` and the object
+    names); `State::live_zero_runs`; `kernelx`'s `arrived` runs (`tell_arrived`) and `sparse::page_committed`, now
+    inside upstream's `committed_page_in` (38e58e1's runs answer the rest) and told of upstream's direct moves
+    (`move_away`, f1e2113: `arrived` and `ghost` follow a page that moves); `TitleMemory` under upstream's
+    `title_bytes` (3984bf1: in place when all of it is readable and it is no GPU view, else page by page) – an
+    address's own memory is copied by upstream's fault-tolerant `copy_committed_region` (27c3571) everywhere
+    but on a Mac (it is ReadProcessMemory, which Wine's server on macOS answers by suspending the process);
+    `pso::Translated`; `note_copy_into`; `cpu_copy` beside upstream's copy scratch (21bc548).
+  - *Unchanged:* everything else of the port (host basics, `isa`, `maskmov`, depth-only formats, the switches,
+    gpu_views / queue #31, the network block, background mode, diagnostics).
+- **The Release fixes** (two faults of the same family: XCL's wrapped `Release` runs where it did not expect to).
+  1. *Re-entrant:* D3DMetal lets go of the references its lists and queues hold through the object's own table, on
+     the calling thread, inside a call XCL makes – `sparse::forget_buffer` then waited for the state's lock its
+     own thread held (the 10 – 18 s stop of `exp/s6-fix`). `forget_buffer` and the free of a buffer's own block
+     (`free_at_release`) take the lock only if it is free, the lock's next holder does what was left
+     (`State::settle_late`: `before_execute`, `place_buffer`, the next Release); `sparse::queue` no longer takes
+     the lock; `late_release::hold` (upstream's e7da8a1, new on this base, which would have waited in
+     `sparse::queue` and in its own lock under the same Release) never waits and on a native host only notes the
+     resource for its thread. Seen live: "a placed buffer was released while the sparse state was locked –
+     forgotten by the lock's next holder" (l1). Other locks a Release takes, audited: the `real.rs` maps,
+     `PLACED_TEXTURES`, `ARENA_OF`, `LAST_CONTENT`, `PRESENTED` are never held across a host call; `TEXTURES` and
+     the queue lists only across AddRef / GetDesc; `vram::ARENAS` across a heap's Release in its sweep; **open:**
+     `vram::PAGES` is held across UpdateTileMappings (`place_on_pages`, `unmap_superseded`) and taken by
+     `forget_pages` – only with `XCL_VRAM_ARENAS=0`, which a Mac does not use.
+  2. *On the host's thread:* the first Release of a run can come on D3DMetal's queue thread while it runs a list.
+     `late_release::enabled()` read `XCL_LATE_RELEASE` through a OnceLock there: that thread stood in the read for
+     good, the list never finished ("texture copy: GPU fence still pending after 10000 ms") and every later
+     Release waited for the OnceLock. In a game a title thread asks first, so it showed only in the unit tests:
+     this is what "the list_x GPU tests hang on this host" was. The switch is an atomic now, read when the first
+     object is adopted; on a native host the late-release thread is started then too. Why the read of a variable
+     does not return on that thread is not known – nothing in a Release should need the Windows side of a thread.
+- **Community changes on the branch** (their authors' commits): #541 (a console MS in the AS slot is translated as
+  the mesh shader it is: 0 "in the AS slot – refused" lines, 2 "translated as MS"); #983, #982, #1024, #957
+  (tests), #890 (XAudio2 GetState), #996 (timestamps are the CPU's clock where the queue reports under 1 MHz: "no
+  GPU timestamps on this host" in the log), and vakaobr's fixture diff from issue #258 (fake extended vtables
+  with the original table at `ext[-HDR]`). Not taken: #787 (f64 skips; did not come up).
+- **Unit tests** under Wine in the bottle, release build, two at a time (`ut1.sh … --test-threads=2`): the port's
+  and upstream's modules of the paths touched (netoff, kernelx, title_textures, late_release, sparse, vram,
+  gpu_views, cpu_writes, maskmov, loader's masked stores, alloc_pool, isa, insn, bcpack, pso_async, present,
+  xaudio2, bind, list_x, real's readback routing, the gpu_sparse / gpu_uma / gpu_atomic GPU tests): 166 passed,
+  3 failed, 4 ignored, in 3.8 s – no hang any more. The three: `write_buffer_immediate_on_open_existing_heap…`
+  (needs OpenExistingHeapFromAddress), `coherent_buffer_sanitizes_console_flags_and_state` (flags 4 where 20 is
+  expected; fails on `mac6`'s binary too), `gpu_sparse_vram_descriptors_buffers_and_xmem` (0 where 1077 is
+  expected when it runs after other tests in one process – on `mac6`'s binary too; alone it passes, with
+  `XCL_WAVE64_SPIN` 0 and 1). The network block's three tests pass with no variable set. Skips that say what this
+  host lacks: 64-bit atomics (#983), GPU UMA (#1024), lazy pages (two of upstream's new map_pages tests), the
+  tolerant copy, and R32_TYPELESS, which D3DMetal makes a reserved texture of while its format query denies it.
