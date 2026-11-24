@@ -2188,14 +2188,72 @@ only its own process), `../tools/sym.py` (names the xcl.exe frames of a thread d
   (tests), #890 (XAudio2 GetState), #996 (timestamps are the CPU's clock where the queue reports under 1 MHz: "no
   GPU timestamps on this host" in the log), and vakaobr's fixture diff from issue #258 (fake extended vtables
   with the original table at `ext[-HDR]`). Not taken: #787 (f64 skips; did not come up).
+  3. *Only a queue entry:* with both fixed a last Release still took the maps' and the texture table's locks
+     where it arrived. On a native host it now writes the resource into a ring of atomics
+     (`late_release::hand_over`) and returns; the late-release thread does the forgetting
+     (`real::forget_released`) and lets the object go when the queues are past the work in flight – the address
+     cannot come again before that. Not with `XCL_LATE_RELEASE=0`, and not when the ring is full (16,128
+     pending): then the Release forgets where it arrives, as before.
+- **Texture levels with nothing behind them** (`XCL_TEXTURE_SKIP_ABSENT`, on by default on a native host): a
+  streamed texture is placed over the 24 GiB GPU view long before pages are mapped under its levels, and every
+  upload detiled and sent all levels, zeros where nothing is. `subresources()` now leaves a level empty when no
+  byte of its place has memory (`TitleMemory::any`), `texture::upload_batch` copies the others and makes no
+  call for a texture with none. Menus (m2): 2,222 levels left out, pictures as before; loading (l4): 24,074.
+  **It was tried as a memory fix and is not one:** 25,292 textures stand for 10.6 GB of title memory over a
+  6.1 GB page pool when loading stops, vm_stat wired goes 13 → 30 GB without the skip (l3) and 14 → 29 GB with
+  it (l4), 37 % free at the stop in both. The textures' video memory is taken whether their empty levels are
+  written or not; what takes it (creation, or the levels that do have pages) is not separated. The streaming
+  phase was 44 s with it and 64 s without – one run each, under a load average of 3 and of 21, so not a
+  measurement of the skip.
 - **Unit tests** under Wine in the bottle, release build, two at a time (`ut1.sh … --test-threads=2`): the port's
   and upstream's modules of the paths touched (netoff, kernelx, title_textures, late_release, sparse, vram,
   gpu_views, cpu_writes, maskmov, loader's masked stores, alloc_pool, isa, insn, bcpack, pso_async, present,
-  xaudio2, bind, list_x, real's readback routing, the gpu_sparse / gpu_uma / gpu_atomic GPU tests): 166 passed,
-  3 failed, 4 ignored, in 3.8 s – no hang any more. The three: `write_buffer_immediate_on_open_existing_heap…`
+  xaudio2, bind, list_x, real's readback routing, texture, tiling, the gpu_sparse / gpu_uma / gpu_atomic GPU
+  tests): 191 passed, 2 failed, 3 ignored in 4.8 s on the branch's head, and the sparse test alone – no hang any
+  more. What fails or is order-dependent: `write_buffer_immediate_on_open_existing_heap…`
   (needs OpenExistingHeapFromAddress), `coherent_buffer_sanitizes_console_flags_and_state` (flags 4 where 20 is
   expected; fails on `mac6`'s binary too), `gpu_sparse_vram_descriptors_buffers_and_xmem` (0 where 1077 is
   expected when it runs after other tests in one process – on `mac6`'s binary too; alone it passes, with
   `XCL_WAVE64_SPIN` 0 and 1). The network block's three tests pass with no variable set. Skips that say what this
   host lacks: 64-bit atomics (#983), GPU UMA (#1024), lazy pages (two of upstream's new map_pages tests), the
   tolerant copy, and R32_TYPELESS, which D3DMetal makes a reserved texture of while its format query denies it.
+- **Live** (bottle `xcl-gta6`, `XCL_NETWORK=0 XCL_BACKGROUND=1 XCL_ACTIVITY=1`, input through `XCL_REMOTE_INPUT`;
+  0 "HTTP Return code" lines in every run; logs `../run/*.log`, window captures `../shots/`).
+  - *Menus, fresh profile:* m1 (on 47efa2e, first Release fix + #541) and m2 (the head: 930e8b4, all of the
+    above). First frame after 4 – 6 s, the sign-in bar after 26 – 28 s (100 – 150 s on 508a0c7: upstream's
+    7296a8b builds the pipelines an earlier run used ahead, "1024 pipelines built ahead of their first use"),
+    the intro video with pictures, NAVIGATION EXPERIENCE, UI TEXT SIZE, SUBTITLES, BRIGHTNESS with its symbol,
+    FINISH SETUP?, LEGAL NOTICES with complete text, both arrows and the button prompts; 30.0 fps per 300 frames
+    (60 presents per 2 s on every page, 31 – 49 for ~4 s while the front end loads under the video); 0 "in the AS
+    slot – refused" (40 before #541), 0 "Failed to compile", no exception. Nothing was pressed on LEGAL NOTICES.
+  - *Loading, accepted profile:* l1, l2 (on 47efa2e) and l3 (930e8b4, before the queue-only Release and the level
+    skip). The title goes from the two A presses into loading at ~88 s; DirectStorage reads 87,333 requests /
+    5.2 GB with 10 failed (0x89240009; 36 and 128 in l1 / l2) and **no BCPack refusal** (upstream's 8cad517:
+    "BCPack BC1 / BC5 / BC7 / BC6H: first request unpacked"; 4,330 – 6,021 refusals a run on the old base);
+    30.0 fps until streaming starts, then 15.1 and 7.1 fps per 300 frames (9 – 31 presents per 2 s; the last
+    300 frames compared 28.7 GiB of title textures in 8.7 s and uploaded 9.8 GiB in 12.0 s).
+    **What stops it (l3, the machine 82 % free at the start):** world loading. The log has "[STUB]
+    ID3D12GraphicsCommandList10::#101 (not on PC) first called from game_scarlett_master.exe+0x50a6657", three
+    "CreateShaderResourceView(RAYTRACING_ACCELERATION_STRUCTURE) … writing empty BVH descriptor" and list #129;
+    presents stop at 152 s and at 172 s the title's GPU-progress watchdog ends it: "unhandled exception
+    0xc0000005 in game_scarlett_master.exe+0x23cf683 (write at address 0x0)". Three thread dumps in those 20 s
+    have the title's main thread waiting at +0x23cf735, no title thread inside XCL and every `xcl-dxc` /
+    `xcl-pso` worker idle – no compile is waited for (yesterday's stop at the same address was compute pipeline
+    compiles; upstream's 25c6f7e / 9a272d4 and the preload took that away). This is upstream's issue #505 ("reaches
+    world loading, then the title's GPU watchdog ('GPU Loc Sig') after ListX #101 stub"): the Mac port is where
+    `main` is. Free memory 71 % until streaming, 37 % when presents stop.
+    **With less memory (l1, l2: other lanes' games resident, 70 – 80 % free at the start)** the same runs fell
+    under 20 % free at 130 s (wired 21 → 36 GB, compressor 7 → 17 GB) and stopped presenting at 124 s, before
+    the world: a loading run wants ~25 GB free.
+  - *Loading on the head (l4: queue-only Release, level skip; 82 % free at the start, load average 3):* the same
+    stop sooner – loading from ~66 s, list #101, presents stop at 110 s, "unhandled exception 0xc0000005 in
+    game_scarlett_master.exe+0x23cf683" after it; 87,577 requests / 5.3 GB / 32 failed, 0 BCPack refusals;
+    30.0 fps before streaming, 18.6 and 15.0 fps per 300 frames in it (l3: 15.1 and 7.1); 0 resources left in
+    late release at any time; wired 14 → 29 GB, 37 % free at the stop.
+- **Not done / open, in order.** (1) #505: list #101 (the BVH build) and whatever the title's watchdog waits for
+  after it – upstream's too. (2) Memory in loading: ~16 GB of wired memory arrive with the streamed textures, the level skip does not
+  change it; what would is the textures' own copies: `#288`'s shared pages are still off here (two reserved textures on the same tiles do not show each
+  other's contents on D3DMetal). (3) Why a Windows call (the read of a variable) does not return on D3DMetal's
+  queue thread. (4) `vram::PAGES` under a re-entrant Release with `XCL_VRAM_ARENAS=0`. (5) The three experiments
+  never run: `XCL_WATCHED_FALLBACK=1`, `XCL_COHERENT_HEAPS=1` and `XCL_LAZY_PAGES=1` with the masked-store
+  helpers. (6) `gpu_sparse_vram_descriptors_buffers_and_xmem` after other tests in one process.
