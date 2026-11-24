@@ -304,6 +304,12 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     Ok(failed)
 }
 
+/// Bytes of the upload buffers the queues keep between batches (one in use by a batch right
+/// now is not counted).
+pub fn staging_bytes() -> u64 {
+    UPLOADERS.lock().unwrap().as_ref().map_or(0, |m| m.values().filter_map(|u| u.staging.as_ref().map(|s| s.2)).sum())
+}
+
 fn put_back(key: usize, up: Uploader) {
     UPLOADERS.lock().unwrap().get_or_insert_with(Default::default).insert(key, up);
 }

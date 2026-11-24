@@ -337,9 +337,11 @@ static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// title textures kept in step with the title's memory now
-pub fn count() -> usize {
-    TEXTURES_LEN.load(Ordering::Relaxed)
+/// Title textures kept in step with the title's memory now, and the bytes of the title's
+/// memory they stand for (each has video memory of its own of about that size).
+pub fn count() -> (usize, u64) {
+    let t = TEXTURES.lock().unwrap();
+    (t.by_res.len(), t.by_res.values().map(|e| e.tex.size()).sum())
 }
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
