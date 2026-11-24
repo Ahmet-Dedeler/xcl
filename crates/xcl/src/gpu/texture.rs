@@ -38,7 +38,16 @@ pub struct Subresource {
     pub rows: usize,
     pub row_bytes: usize,
     pub depth: usize,
+    /// the texels; empty: nothing to copy (`absent`) – the subresource keeps what it has
     pub data: Vec<u8>,
+}
+
+impl Subresource {
+    /// A subresource an upload leaves as it is: its place in the title's memory has no memory
+    /// behind it (a streamed texture's levels before their pages are mapped).
+    pub fn absent(&self) -> bool {
+        self.data.is_empty()
+    }
 }
 
 /// Where and how a T#'s texture lies in console memory.
@@ -164,7 +173,7 @@ fn validate_subresources(subs: &[Subresource]) -> Result<(), String> {
             .checked_mul(s.rows)
             .and_then(|n| n.checked_mul(s.row_bytes))
             .ok_or_else(|| format!("texture subresource {i} size overflow"))?;
-        if s.data.len() < bytes {
+        if !s.absent() && s.data.len() < bytes {
             return Err(format!("texture subresource {i} has {} B, needs {bytes} B", s.data.len()));
         }
     }
@@ -269,6 +278,10 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     let mut planned = Vec::with_capacity(items.len());
     let mut total = 0u64;
     for (k, (res, subs, states)) in items.iter().enumerate() {
+        // (nothing to copy: no barriers either)
+        if subs.iter().all(Subresource::absent) {
+            continue;
+        }
         match layout(dev, res, subs, states, states) {
             Ok(l) => {
                 let base = total.div_ceil(PLACEMENT) * PLACEMENT;
@@ -382,6 +395,9 @@ unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource],
 unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], l: &Layout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], up: &ID3D12Resource, mapped: *mut u8, base: u64) {
     let n = subs.len();
     for ((s, fp), &nrows) in subs.iter().zip(&l.fps).zip(&l.rows) {
+        if s.absent() {
+            continue;
+        }
         let pitch = fp.Footprint.RowPitch as usize;
         let row = s.row_bytes.min(pitch);
         // depth slices are NumRows rows apart (rows of 4×4 blocks for BCn)
@@ -398,6 +414,9 @@ unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, su
         list.ResourceBarrier(&to_copy);
     }
     for (k, fp) in l.fps.iter().enumerate() {
+        if subs[k].absent() {
+            continue;
+        }
         let dst = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::transmute_copy(res),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,

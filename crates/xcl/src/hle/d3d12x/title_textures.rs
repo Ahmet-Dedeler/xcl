@@ -1268,7 +1268,7 @@ fn note_content(va: usize, r: &ID3D12Resource, subs: &[texture::Subresource]) {
     if d.Width < 64 || d.Height < 64 || N.fetch_add(1, Ordering::Relaxed) >= 48 {
         return;
     }
-    let nonzero = top.data.iter().filter(|&&b| b != 0).count();
+    let nonzero = top.data.iter().filter(|&&b| b != 0).count(); // (an absent level: 0 of 0)
     crate::xlog_info!(
         "frame trace: title texture at {va:#x} ({}x{} format {}) uploaded: {nonzero} of {} bytes of level 0 not zero",
         d.Width,
@@ -1673,6 +1673,19 @@ impl TitleMemory {
         }
     }
 
+    /// Whether any byte of `[at, at + n)` has memory behind it.
+    unsafe fn any(&mut self, mut at: usize, n: usize) -> bool {
+        let end = at.saturating_add(n);
+        while at < end {
+            let (src, same) = self.locate(at);
+            if src != 0 {
+                return true;
+            }
+            at = at.saturating_add(same);
+        }
+        false
+    }
+
     /// `n` bytes at `at` to `dst`; what is nowhere stays as `dst` has it. Returns whether all
     /// of it was read.
     unsafe fn read(&mut self, mut at: usize, mut dst: *mut u8, mut n: usize) -> bool {
@@ -1706,13 +1719,53 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
         return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
+    let skip = absent_skip();
+    let mut memory = TitleMemory::new();
     for s in 0..tex.array as usize {
-        let slice = title_bytes(va + s * c.slice_bytes, c.slice_bytes);
+        let at = va + s * c.slice_bytes;
+        let slice = title_bytes(at, c.slice_bytes);
+        // (bytes used where they are: all of them are there)
+        let whole = !skip || matches!(slice, std::borrow::Cow::Borrowed(_));
         for (i, l) in c.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
+            // where the level lies in the slice: the tail block, or from its offset to the next
+            // larger level's (the levels follow each other from the smallest to mip 0)
+            let (a, b) = match l.tail {
+                Some(_) => (0, c.layout.block_bytes.min(c.slice_bytes)),
+                None => (l.offset, if i == 0 { c.slice_bytes } else { c.levels[i - 1].offset.max(l.offset) }),
+            };
+            let data = if whole || memory.any(at + a, b.saturating_sub(a)) {
+                c.detile_level(&slice, i, s)
+            } else {
+                ABSENT.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            };
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data });
         }
     }
     out
+}
+
+/// subresources left out of uploads so far because nothing was behind them (`absent_skip`)
+static ABSENT: AtomicU64 = AtomicU64::new(0);
+
+/// How many subresources uploads left out because their place in the title's memory had no
+/// memory behind it.
+pub fn absent() -> u64 {
+    ABSENT.load(Ordering::Relaxed)
+}
+
+/// Whether a subresource with no memory behind any of its bytes is left out of an upload
+/// (`XCL_TEXTURE_SKIP_ABSENT=1` / `0`; unset: on a native host). A retail game places its
+/// streamed textures over a view of 24 GiB and maps pages under their levels as it loads them:
+/// every upload detiled and copied all levels, zeros where nothing is mapped – 24,074 such
+/// levels in one loading run. What it does not do is save memory: with and without it the same
+/// run stood at 29 – 30 GB wired when it stopped (the textures' video memory is taken either way).
+fn absent_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("XCL_TEXTURE_SKIP_ABSENT") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed),
+    })
 }
 
 

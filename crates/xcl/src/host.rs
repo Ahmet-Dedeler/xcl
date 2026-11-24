@@ -63,7 +63,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let mb = |b: u64| b >> 20;
                 let textures = crate::hle::d3d12x::title_textures::count();
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); {} title textures kept in step ({} MB of title memory), upload buffers {} MB; {} resources held for a late release",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); {} title textures kept in step ({} MB of title memory, {} levels left out of uploads: nothing behind them), upload buffers {} MB; {} resources held for a late release",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -75,6 +75,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools_mapped as u64),
                     textures.0,
                     mb(textures.1),
+                    crate::hle::d3d12x::title_textures::absent(),
                     mb(crate::gpu::texture::staging_bytes()),
                     crate::hle::d3d12x::late_release::held().map_or("?".to_string(), |(n, sealed)| format!("{n} ({sealed} behind a fence)"))
                 );
