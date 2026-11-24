@@ -840,10 +840,16 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // XCL's stub or method – and the host's words after them follow XCL's slots, so a call of
     // its own never runs off the end.
     let native_host = m0 == 0;
+    // (what a Release asks is read from the environment now, on a thread of XCL's or the title's:
+    // a host may call Release on a thread of its own – D3DMetal's queue thread did, and stood in
+    // the read of the variable with the queue's work unfinished behind it)
+    super::late_release::enabled();
     if native_host {
         static ONCE: AtomicBool = AtomicBool::new(false);
         if !ONCE.swap(true, Ordering::Relaxed) {
             crate::gpu::shader::NATIVE_HOST_MEMORY.store(true, Ordering::Relaxed);
+            // (and the thread that lets held resources go is started now, not in a Release)
+            super::late_release::start_thread();
             crate::xlog_warn!("D3D12.X: the host's D3D12 is not a PE module (a native host: D3DMetal) – its memory is probed by reading, its tables keep their prefix and tail");
         }
     }

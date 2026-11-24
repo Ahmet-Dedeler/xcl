@@ -88,8 +88,17 @@ static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
 /// Whether last releases are held (`XCL_LATE_RELEASE=0` turns it off).
 pub fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("XCL_LATE_RELEASE").is_ok_and(|v| v.trim() == "0"))
+    // (no lock, not even a OnceLock's: this is asked in every Release, and a Release can come on
+    // any thread at any depth – two that ask first at once both read the variable)
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    match ON.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let on = !std::env::var("XCL_LATE_RELEASE").is_ok_and(|v| v.trim() == "0");
+            ON.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+            on
+        }
+        n => n == 1,
+    }
 }
 
 /// Resources held now: (not let go yet, of them in batches closed with a fence value). None:
@@ -148,9 +157,12 @@ pub unsafe fn hold(res: usize) {
 /// resources `hold` could not note because the lock was held (never held across a host call)
 static LATE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-fn start_thread() {
+pub(super) fn start_thread() {
     static THREAD: std::sync::Once = std::sync::Once::new();
     THREAD.call_once(|| {
+        if !enabled() {
+            return;
+        }
         let _ = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
             std::thread::sleep(TICK);
             unsafe { drain_known(false) };
