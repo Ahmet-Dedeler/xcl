@@ -70,15 +70,21 @@ bottle's settings). In the bottle's `cxbottle.conf` that is:
 
 `ROSETTA_ADVERTISE_AVX` makes Rosetta 2 report AVX and AVX2, which XCL's CPU check asks for.
 
+Set the CrossOver location and your bottle name in the shell used for the examples below.
+
+```sh
+export CX="/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin"   # or under ~/Applications
+export XCL_MAC_BOTTLE="My XCL Bottle"   # use the name of your bottle
+```
+
 ## Run
 
 Wine shows the Mac's file system as drive `Z:`, so a Mac path `/Users/me/Games/Title` is
 `Z:\Users\me\Games\Title` to XCL. `Z:/Users/me/Games/Title` works too.
 
 ```sh
-CX="/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin"   # or under ~/Applications
 XCL_DATA_ROOT='Z:\Users\me\xcl-data' WINEDEBUG=-all \
-  "$CX/wine" --bottle <bottle> "Z:$PWD/target/x86_64-pc-windows-gnu/release/xcl.exe" \
+  "$CX/wine" --bottle "$XCL_MAC_BOTTLE" "Z:$PWD/target/x86_64-pc-windows-gnu/release/xcl.exe" \
   run 'Z:\Users\me\Games\Title' < /dev/null
 ```
 
@@ -98,7 +104,12 @@ cargo build --workspace --target x86_64-pc-windows-gnu
 
 cat > /tmp/xcl-wine-runner <<'EOF'
 #!/bin/sh
-exec "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine" --bottle <bottle> "Z:$1" "${@:2}" < /dev/null
+case "$1" in
+  /*) exe="Z:$1" ;;
+  *)  exe="Z:$PWD/$1" ;;
+esac
+shift
+exec "$CX/wine" --bottle "$XCL_MAC_BOTTLE" "$exe" "$@" < /dev/null
 EOF
 chmod +x /tmp/xcl-wine-runner
 
@@ -126,9 +137,8 @@ into Mac paths:
 
 ```sh
 #!/bin/zsh
-# xcl-wine: put it next to xcl.exe; XCL_MAC_BOTTLE and XCL_MAC_DATA (a Mac folder) must be set
+# Put xcl-wine next to xcl.exe. It reads CX, XCL_MAC_BOTTLE and XCL_MAC_DATA (a Mac folder).
 here=${0:A:h}
-CX="/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin"
 out=$(mktemp -d)
 args=()
 for a in "$@"; do
@@ -143,7 +153,7 @@ exit $code
 ```
 
 ```sh
-XCL_MAC_BOTTLE=<bottle> XCL_MAC_DATA=$HOME/xcl-data \
+XCL_MAC_DATA="$HOME/xcl-data" \
   pwsh -NoProfile -File scripts/smoke.ps1 -Game /Users/me/Games/Title -Seconds 60 \
   -Xcl target/x86_64-pc-windows-gnu/release/xcl-wine
 ```
@@ -157,5 +167,5 @@ Wine keeps helper processes (`wineserver`, `winedevice.exe`, `conhost.exe`) afte
 debugger keeps a crashed process. To end everything that belongs to one bottle:
 
 ```sh
-WINEPREFIX="$HOME/Library/Application Support/CrossOver/Bottles/<bottle>" "$CX/wineserver" -k
+WINEPREFIX="$HOME/Library/Application Support/CrossOver/Bottles/${XCL_MAC_BOTTLE:?set the bottle name}" "$CX/wineserver" -k
 ```
